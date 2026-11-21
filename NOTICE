@@ -1,0 +1,5 @@
+makermods-llm-harness
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Motion planning uses the trajectory inverse kinematics of the metal-arm and maker-arm SDKs (Apache License,
+Version 2.0), a numpy port of the algorithm in Dream Labs' dream_ik; see the SDKs' NOTICE files.

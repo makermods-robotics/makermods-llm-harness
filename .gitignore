@@ -1,13 +1,8 @@
 .venv/
 __pycache__/
-*.pyc
-logs/
-Log/
-.pytest_cache/
 *.egg-info/
-frames/
-frames-*/
-recordings/
-*-server.log
-.ruff_cache/
+.pytest_cache/
+.worktrees/
+build/
 dist/
+runs/

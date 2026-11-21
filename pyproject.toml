@@ -1,48 +1,33 @@
 [build-system]
-requires = ["hatchling>=1.18"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "metal-arm-harness"
+name = "makermods-llm-harness"
 version = "0.1.0"
-description = "A safety-enveloped operator harness for real robot arms that any agent can drive from the command line. Metal control plus Maker Arm simulation and read-only commissioning."
+description = "Let an LLM move a Metal or Maker arm: tool targets in, camera images and joint state out, behind a table-floor safety envelope"
 readme = "README.md"
-# lerobot (the Damiao driver layer) requires >=3.12.
-requires-python = ">=3.12"
-license = "MIT"
-authors = [{ name = "MakerMods" }]
-
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.26",
-    "pillow>=10.0",
-    "ruckig==0.15.3",        # standalone jerk-limited trajectories (no ROS)
-    "pin>=3.0",              # Pinocchio, for forward kinematics
-    "lerobot[damiao]>=0.4",  # Metal + Robstride bus; pinned Maker follower compatibility copy included
+  "metal-arm @ git+https://github.com/makermods-robotics/metal-arm-sdk",
+  "maker-arm @ git+https://github.com/makermods-robotics/maker-arm-sdk",
+  "numpy",
+  "opencv-python",
+  "pyyaml",
 ]
 
-[project.optional-dependencies]
-camera = ["opencv-python>=4.8"]
-dev = ["pytest>=8.0", "ruff>=0.6"]
-
 [project.scripts]
-metal-arm-harness = "metal_arm_harness.cli:main"
+llm-harness = "makermods_llm_harness.cli:main"
 
-[tool.uv.sources]
-# The Metal robot classes live on lerobot's arm/makermods-metal branch, not on PyPI.
-lerobot = { git = "https://github.com/makermods-robotics/lerobot.git", branch = "arm/makermods-metal" }
+[project.optional-dependencies]
+mujoco = ["mujoco>=3.1"]
+mcp = ["mcp>=2"]
+agent = ["anthropic>=2"]
+dev = ["pytest"]
 
-[tool.uv]
-build-constraint-dependencies = ["scikit-build-core<0.10"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/metal_arm_harness"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-
-[tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
-
-[tool.ruff.lint.per-file-ignores]
-"src/metal_arm_harness/_vendor/**" = ["ALL"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,242 +1,360 @@
-# Operating the Metal arm through this harness
+# Operating guide
 
-**These bench facts apply to Metal only. For Maker Arm, read [MAKER.md](MAKER.md).**
+For whoever is the policy: a coding agent that runs `llm-harness op ...` and reads the JPEG files, or an MCP client
+whose model calls the same actions as tools. The [operator section](#operator) at the end is for the person who
+starts the robot and keeps a hand on the emergency stop.
 
-This is the procedure for whoever is driving — a person, or an agent that
-can run shell commands and look at JPEG files. Read it once, then follow it.
-The safety envelope stops you pressing the arm into the table; it does not
-stop you wasting twenty minutes. This document is about the second part.
+The CLI forms are shown. Over MCP the tool names and fields are the same (`move_tool` with `xyz`, `pitch_deg`, ...)
+and the images come back inline instead of as paths.
 
-## 0. What you are controlling
+## The loop
 
-Seven joints in degrees: `shoulder_pan shoulder_lift elbow_flex wrist_flex
-wrist_yaw wrist_roll gripper`. Base frame: **x forward** (the direction the
-gripper points at the zero pose), **y left**, **z up**, origin at the base;
-the table top is at about z = 0.02 m. At the zero pose the arm is folded with
-the forearm horizontal and the tool tip at about (0.16, 0, 0.19) m.
+1. Once: `llm-harness op describe`. It names the arms, cameras, joint ranges, where `home` puts the tool, the table
+   height and the envelope numbers.
+2. `llm-harness op observe`, then open every image path it prints.
+3. Decide one action. Say what you expect to see after it.
+4. Send it, read the result line, the numbers and the fresh images. Back to 3.
 
-- `shoulder_lift` 0 = folded back; more negative leans the arm forward and
-  down. `elbow_flex` positive raises the forearm. `wrist_flex` negative
-  pitches the gripper down. `wrist_roll` rotates the jaws about the tool axis.
-- Gripper: 0 closed, 112 is a safe "fully open"; jaws close on a ~4 cm
-  object around 70. Grip force = gripper gain (20) x the driver lead cap
-  (8° by default ≈ 2.8 N·m). **Do not raise the gripper lead cap**: 30° or
-  more stalls the small motor into its rotor-overtemp fault within
-  seconds (the feedback shows a 71-73 °C spike, the motor latches off, the
-  plug drops). If it happens: `op clear-faults`, then keep 8°. Once the
-  squeeze is maintained through later moves (it is now), 8° lifts the
-  charger fine. Always `op close` (all the way); the stall detector stops
-  the report at contact.
-- Pitch in `tip`/`nudge`/`status` is the tool axis angle: 0 horizontal,
-  -80 pointing almost straight down. **The floor was measured at -80°**, so
-  a near-vertical grasp has an exact floor; shallower pitches are slightly
-  conservative.
-
-## 1. Start (once per session, ~1 minute)
+One action per call keeps you looking between motions. `llm-harness ops` sends a short list and stops at the first one
+that is not `done`, so a refused descent is never followed by a close on air:
 
 ```bash
-# Ports and cameras on this bench (re-check if USB was replugged:
-#   ls /dev/cu.usbmodem*   and   ffmpeg -f avfoundation -list_devices true -i "")
-PORT=/dev/cu.usbmodem2067359645431
-CAMS="overhead=2,front=0,wrist=1"        # never index 3: the laptop camera
-ROBOT_ID=metal_metal                      # LeRobot zero-pose calibration file
-
-# Floor: only if the arm or table moved since the saved ritual.
-metal-arm-harness calibrate --port $PORT --robot-id $ROBOT_ID --watch
-#   -> operator lifts the arm, rests the gripper tip on the table, holds 5 s.
-#   Power must be ON for the handshake; if "motors did not respond", it is off.
-
-# Session. Unarmed first if anything is uncertain; add --armed --confirm-armed
-# only after the operator has said go. Lead caps default to the bench-tuned
-# table (shoulder_lift 5, elbow_flex 3, gripper 8, others 2).
-metal-arm-harness serve --port $PORT --robot-id $ROBOT_ID --cameras "$CAMS" \
-    --reuse-table --frames-dir frames --armed --confirm-armed &
-metal-arm-harness op status
+llm-harness ops "nudge 0 0 -0.02" "gripper close"
 ```
 
-`serve` refuses to start if a camera index no longer maps to a device named
-"KD-USB" (`--require-camera-name`): when one USB camera drops off, every
-index after it shifts and index 2 becomes the laptop camera. If that
-message appears, or the serial device is gone, the USB hub has
-disconnected — stop and tell the operator; do not probe other indices.
+Do not chain `op` calls with `;` in the shell for the same reason.
 
-Several commands in one call, stopping at the first error:
-`metal-arm-harness ops "open" "tip 0.44 -0.12 0.034 -80" "close" "tip 0.44 -0.12 0.16 -80"`.
-Never chain with `;` or with `| sed` without `set -o pipefail`: a rejected
-descent followed by `close` grips air (happened three times).
+## Reading an observation
 
-If the arm rests on the table after the ritual, `op nudge up=0.05` lifts it:
-from inside the floor margin only rising or level moves are accepted.
+```
+arm: tool xyz [0.280, -0.000, 0.120] m, pitch -90, yaw -0, roll 0 deg; gripper 1.00; clearance above table 0.095 m
+  joints (deg): shoulder_pan 0.1, shoulder_lift -100.3, elbow_flex 74.0, wrist_flex -62.7, wrist_yaw 0.0, wrist_roll 0.1
+camera top: /home/you/.makermods-llm-harness/runs/20261120-182307-sim/images/step-0005-top.jpg
+camera side: /home/you/.makermods-llm-harness/runs/20261120-182307-sim/images/step-0005-side.jpg
+```
 
-## 2. The loop
-
-Each step is `op <command>` → read the reply → **open the three JPEGs** →
-decide the next command. Commands return in ~0.1 s plus motion time.
-
-| command | use |
+| Part | How to use it |
 |---|---|
-| `op observe` | fresh frames, no motion |
-| `op tip X Y Z PITCH` | absolute tool-tip target (m, deg) via IK |
-| `op nudge forward=0.02 left=-0.01 up=0 pitch=-80` | relative move in the arm's horizontal frame; any subset |
-| `op goto shoulder_pan=-15 wrist_roll=-9` | raw joints; big moves play as approved legs |
-| `op gripper 112` / `op gripper 45` | jaws; a reply saying "holding something" means contact |
-| `op rest` | zero pose, jaws unchanged |
-| `op clear-faults` | clear a latched motor fault (rotor overtemp etc.) and re-enable |
-| `op quit` | end; the arm keeps holding |
+| first line, when present | `rejected: ...`, `stopped: ...` or `fault: ...` and why. No such line means `done`. |
+| `tool xyz` | the tool point (between the gripper fingers) in the world frame, metres. Plan in these numbers. |
+| `pitch, yaw, roll` | the gripper's orientation, in the angles `move_tool` takes (next section) |
+| `gripper` | measured opening, 0 closed .. 1 open. After a close, a value well above 0 means the jaws stopped on something. |
+| `clearance above table` | height of the lowest monitored point (elbow and wrist joints, tool point, fingertips, tips of the open jaws) above the table, as measured. Motions keep it above the hard floor (0 mm by default: the table surface; next sections). |
+| `keep-out zone NAME D m away` | the keep-out zone closest to any part of the arm and how far (only when the robot has zones; `op describe` lists them with their corners) |
+| `(motors off)` after the arm name | the arm is released at rest; the next motion turns it on |
+| `(torque state unknown)` | the motors do not report whether torque is on (older firmware); the next motion turns them on |
+| `joints (deg)` | the six arm joints; the names are the ones `move_joints` takes |
+| `camera NAME: PATH` | a JPEG written for this step; open it. An error text instead means that camera had no recent image. `(stale: N s old ...)` means no frame taken after the action ended arrived in time: the picture may show the arm before it stopped. |
 
-Every move reply ends with a residual and, when it happened, `Measured reverse excursion
-N deg on <joint>`: the largest excursion away from the target during the
-move. It is a diagnostic measurement, not a corrective action. If it grows, inspect
-the motion trace and camera views before continuing (see §5).
+`--json` prints the same as one JSON object (see the README for the fields). Images are in the run's `images/`
+directory: `step-NNNN-<camera>.jpg` for an action (`NNNN` is the step number) and `look-NNNN-<camera>.jpg` for a look
+that is not an action (a model loop's first look, a session client's `observe()`).
 
-Every reply ends with `clearance N mm` and `tip (x, y, z) m pitch P deg`.
-Plan in those numbers, not in joint angles.
+Cameras in the simulators:
 
-## 3. Pick and place, the version that works
+| Camera | View |
+|---|---|
+| `top` | looking down: +x (away from the arm) is up the image, +y is to the left |
+| `side` (kinematic simulator) | looking along +y: +x to the right, z up; best for heights |
+| `<arm>_wrist` (`arm_wrist` in `sim --mujoco`) | from the gripper along its pointing direction; the jaws are at the bottom of the image |
 
-0. **Map the scene BEFORE grasping.** With empty jaws, hover at ~15 cm
-   over the destination (`op tip X Y 0.15 -80`) and read the wrist frame:
-   it shows the container around the jaws with no object in the way. Write
-   down the container centre in tip coordinates. Do not estimate it from
-   the side cameras (§4).
-1. **Look from above.** `op tip 0.22 -0.02 0.12 -50`, then read the wrist
-   frame. Targets appear where they are relative to the jaws; distances are
-   still rough (see §4).
-2. **Hover over the object** at ~6 cm clearance, pitch -80, jaws **wide
-   open (112)** — jaws only slightly wider than the object land on its edges
-   and push it. `op tip X Y 0.08 -80`.
-3. **Align.** In the wrist frame the object should sit centred between the
-   jaws and square to them. Left/right: `nudge left=±0.01`. Rotation: `goto
-   wrist_roll=…`; **negative roll turns the jaws clockwise in the wrist
-   image**. The object's near edge should be a little *below* the jaw-tip
-   line in the frame at 6 cm height; if it is above, `nudge forward=0.02`.
-4. **Descend** to `clearance` ≈ 20-25 mm (`nudge up=-0.04`). Check the front
-   camera: jaws should straddle the object's middle, not its near end.
-5. **Close** with `op close`. Read the reply. It says one of:
-   - `holding something (grip torque X N·m)` — a real grasp; proceed;
-   - `holding something but grip torque is only …` — the jaws are resting
-     ON the object, not around it: `op open`, go 5-8 mm lower, close again;
-   - no stall at all (gripper near 0) — closed on air: re-aim.
-   Every later move re-checks the jaws. `OBJECT LOST` in a reply means
-   they closed well past the contact angle: the object slipped out. Stop,
-   look, re-approach around its middle.
-6. **Lift high.** A held object hangs from the jaws and swings ~5 cm below
-   the tips; lift to clearance ≥ 12 cm before any pan (`nudge up=0.10`), or
-   you will knock the destination.
-7. **Move over the destination** (the coordinates from step 0), then lower
-   until the object's bottom is ~1 cm above the container floor before
-   opening — a level grip hangs ~4.5 cm below the tips, so tips at ~5.5 cm
-   clearance. Releasing from 6 cm let the plug tumble off the rim twice.
-   Then `op open`, `tip … 0.16`, `op rest`.
+On a real robot the cameras are whatever the robot file names; `op describe` lists them. Read heights from the
+numbers rather than from the images.
 
-Use absolute `op tip X Y Z` for heights. Relative `nudge up=-0.05` from a
-mis-remembered height put the jaws 5 cm too high twice.
+## Frames and tool angles
 
-Operator says "a little forward"? That is `op nudge forward=0.02`. Say what
-you see and what you are about to do before each motion.
+The world frame has z up. With one arm at the default base it is the arm's base frame: x forward (away from the
+base), y left, z up, origin at the base. With two arms each base sits where the robot file's `bases:` puts it.
 
-## 4. Reading the cameras
+The pointing direction of the gripper is `(cos p cos y, cos p sin y, sin p)` for pitch p and yaw y:
 
-- **wrist** (index 1) is mounted on the gripper, looking down the jaws. Jaw
-  tips appear at the bottom of the frame. The camera sits behind and above
-  the tips, so the point on the table directly under the tips appears
-  slightly *above* the tip line, more so at height. Image right ≈ -y (more
-  negative pan). Rotation of the object relative to the frame's vertical is
-  the roll you need to add.
-- **front** (index 0) looks across the table from the side: the best view
-  for "are the jaws around the middle of the object" and for height.
-- **"overhead"** (index 2) is NOT overhead. It sits on the +y side of the
-  table looking across: image-right ≈ +x, image-down ≈ -y, and anything
-  held in the air projects higher in the frame than its spot on the table
-  (a plug at 6 cm looked "inside" the case and landed 4 cm outside it).
-  Use it for x and for "did it go in"; never for y of a raised object.
-- **front** (index 0): image-left ≈ +y, image-down ≈ +x (closer to it).
-- Auto-exposure: the first frame after a long pause may be dark; the session
-  discards a few frames per observe already.
+| Angle | Meaning |
+|---|---|
+| `pitch_deg` | tilt of the pointing direction: -90 straight down, 0 horizontal, +90 straight up |
+| `yaw_deg` | heading of the pointing direction about the vertical: 0 = +x, 90 = +y |
+| `roll_deg` | turn of the gripper about its pointing direction |
 
-## 5. Things that already went wrong (do not repeat)
+With roll 0 the tool x axis is horizontal; in both simulators the jaws close along it (on a real arm, confirm in the
+wrist image). `move_tool` keeps the current pitch and roll when you leave them out, and points the yaw from the arm's
+base towards the target; leaving out both pitch and roll keeps the gripper's exact orientation, turned about the
+vertical by the change of heading.
 
-- **Grid-searching poses** took 40 s each; `tip`/`nudge` solve in 1 ms.
-- **One process per command** paid a 2 s CAN handshake and camera warm-up
-  every step; `serve` pays once.
-- **Jaws at 84° on a 4 cm block** landed on its edges and shoved it 3 cm.
-  Open to 112 first.
-- **Descending in small increments** sagged the arm under the floor margin
-  and locked every move; now the envelope allows rising moves from there,
-  and the controller cancels sag, but still plan grasps at 20-25 mm
-  clearance, not 10.
-- **Gripping off the centre of mass** left the block tilted and swinging;
-  it hit the case on the way over. Grip the middle, lift high before panning.
-- **Swinging the pan with a load at 5 cm clearance** moved the case. See
-  step 6.
-- **Handshake failed: "motors did not respond"** means the 24 V supply is
-  off — the operator powers the arm off to move it by hand. It is not the
-  USB adapter. **"could not open port"** or cameras named "MacBook" at the
-  bench indices means the USB hub dropped: stop.
-- **The dip at the start of every move** was the new waypoint stream
-  starting from the measured pose, discarding the lead the shoulder held
-  against gravity, and the settle then holding the bare target. Fixed:
-  streams start from the last command sent and the settle inherits the
-  lag; the reply reports any remaining counter-dip.
-- **Grasp slipped four times in run 2** with the plug clearly between the
-  jaws: the controller had relaxed the squeeze after the stall (commanded
-  the measured angle) and the stale-base check reset the gripper goal.
-  Both fixed; a stalled gripper keeps its closed goal through every later
-  move. Raising force instead tripped the motor fault (above).
-- **Grasp geometry**: grip the charger's middle at 12-18 mm tip clearance;
-  a grip near its top edge popped out of the V-jaws on lift.
+Example 1, straight down. `op move_tool 0.28 0 0.12 --pitch -90` points the gripper down over x = 0.28 with yaw 0:
+the tool x axis, and so the jaws, run along world y (left-right). To close them along x instead, turn the gripper 90
+deg about the vertical, at most about 30 deg per action:
 
-## Recording endpoint motion
+```bash
+llm-harness op move_tool 0.28 0 0.12 --pitch -90 --yaw 30
+llm-harness op move_tool 0.28 0 0.12 --pitch -90 --yaw 60
+llm-harness op move_tool 0.28 0 0.12 --pitch -90 --yaw 90
+```
 
-`op trace-tip X Y Z PITCH [SECONDS]` uses the normal IK/envelope path and then
-records a read-only dwell (default 5 seconds). `op monitor 5` records the current
-hold without sending motor commands. Both return encoder peak-to-peak ranges
-and the episode log path. The log contains `motion_sample` events for play,
-settle and hold, with monotonic timestamps, encoder positions, requested commands,
-joint goals, torque and FK tip positions. `command_deg` is before driver lead limiting;
-`last_applied` records the preceding driver send with its own monotonic timestamp,
-post-limit position, zero velocity target and effective gains (before wire quantization).
-FK positions are encoder-derived estimates, not external camera measurements.
+Within 0.5 deg of straight down (or up) yaw and roll would turn the gripper about the same axis, so the observation
+reads roll 0 there and yaw carries the whole turn; the last command above reads `pitch -90, yaw 90, roll 0`.
 
-Plot a move with `python scripts/plot_motion_trace.py LOG --move-id N` (requires
-matplotlib). Orange marks settling; green marks the read-only hold.
+Example 2, tilted. From the Maker arm's `home`, `op move_tool 0.30 0.10 0.15 --pitch -45` puts the tool point at
+(0.30, 0.10, 0.15) pointing 45 deg below horizontal; the yaw defaults to the heading from the base to the target,
+atan2(0.10, 0.30) = 18 deg, so the gripper points forward-left and down, away from the base. The observation reads
+`pitch -45, yaw 18, roll 0`.
 
-Settling starts with the previous command offset, not the measured arrival lag.
-Integral trim is time-based, limited to 0.75 degrees/second and ±2 degrees, and
-stops adjusting joints within the 0.5-degree tolerance. Convergence also requires
-a 0.4-second stable window. Jaw-only commands retain the arm's held command
-without initiating position trim. A rejected trim retains the last approved hold.
+`nudge` offsets are in the arm's base axes (`--frame base`: x forward, y left, z up) or in the gripper's own axes
+(`--frame tool`: z is the pointing direction). Pointing down, `op nudge 0 0 0.02 --frame tool` moves 2 cm down.
+A nudge is added to the pose the last motion was sent to while the arm holds still within 10 mm and 3 deg of it, so
+a real arm's standing error of a few millimetres does not eat into small nudges; after a stop or a fault, or when
+the arm stands further off, it is added to the measured pose.
 
-## Smooth trajectories and driver diagnostics
+## Approaching and grasping from above
 
-Full moves now use standalone Ruckig 0.15.3, calculated locally without ROS or
-cloud services. Joint trajectories start and finish at zero velocity and acceleration,
-with phase synchronization, acceleration capped at 20 deg/s² and jerk at 80 deg/s³.
-The configured speed cap still applies; paths entering the slow zone run entirely at
-the slow speed. Every sampled pose passes the existing floor and limit checks.
-Small endpoint trims retain the bounded rate limiter described above.
+1. Look at the scene from high up and find the object in the images. Get its x, y from where it sits relative to the
+   gripper and the table, then check by hovering above it.
+2. Turn the gripper down in steps (below), ending about 10 cm above the object.
+3. Open the gripper fully before you descend: jaws only slightly wider than the object land on its edges.
+4. Line up over the object in the top and wrist images (`nudge` by 1-2 cm sideways).
+5. Descend in small steps, 2-5 cm each, looking after each one. Within 76 mm of the table every motion runs at the
+   slow speed, so short steps take a few seconds each. By default the envelope lets the tool point come down to about
+   25 mm above the table pointing straight down on a Metal arm (fingertips 10 mm) and 26-35 mm on a Maker arm at
+   pitch -45 to -70 (fingertips 2-3 mm): the arm may touch the table.
+6. Close. Read `gripper`: well above 0 means the jaws stopped on the object; near 0 means they closed on air. In the
+   simulators a closed grip on the 4 cm cube reads about 0.4-0.5.
+7. Lift straight up (`op nudge 0 0 0.06`) before moving sideways, and look: the object should rise with the jaws.
 
-Metal position commands use zero desired motor velocity. The follower's inferred
-velocity feedforward is disabled: differentiating feedback-clipped goals introduced
-an additional feedback path, and its final nonzero velocity could remain latched.
-Configured Kd is capped at the driver's wire limit of 5; this makes the config honest
-and does not increase damping or change the protocol range. Motor stiffness is unchanged.
+A Metal arm from `home` (tool at about [0.31, 0, 0.58], pointing forward and slightly up) needs several `move_tool`
+steps to point straight down; each changes the pitch by about 20 deg. This sequence picks the cube at x = 0.28 in the
+simulators:
 
-`python scripts/compare_motion.py LOG:MOVE_ID [LOG:MOVE_ID ...] --output diagnostics/compare`
-plots shoulder/elbow encoders, requested/applied positions, requested speeds, and
-2-6 Hz tracking error. It writes PNG and JSON, excludes recording gaps, and needs
-numpy, scipy and matplotlib. Different paths are not controlled A/B tests; encoder
-sampling cannot exclude higher-frequency vibration or structural flex.
+```bash
+llm-harness op home
+llm-harness op move_tool 0.31 0 0.54 --pitch -5
+llm-harness op move_tool 0.30 0 0.47 --pitch -25
+llm-harness op move_tool 0.29 0 0.39 --pitch -45
+llm-harness op move_tool 0.285 0 0.30 --pitch -65
+llm-harness op move_tool 0.28 0 0.21 --pitch -85
+llm-harness op move_tool 0.28 0 0.125 --pitch -90
+llm-harness op gripper open
+llm-harness op move_tool 0.28 0 0.035 --pitch -90
+llm-harness op gripper close
+llm-harness op nudge 0 0 0.10
+```
 
-When installing Ruckig from source with pip, use a build constraint
-`scikit-build-core<0.10` (the upstream 0.15.3 build uses the older configuration key).
-The uv project configuration supplies this constraint automatically. Ruckig supports
-macOS, Linux and Windows; this session's hardware validation runs on Linux only.
+The Maker arm cannot point straight down this close to its base. Near the table use a pitch of -45 to -60. Its
+`home` already sits low (tool at about [0.32, 0, 0.12], pitch -38):
 
-For a deliberate restart of an already powered, stationary hold, first run
-`op monitor 3`, then `op quit`. Restart the same arm with `serve --resume-log LOG`
-and the same calibration/options. Resume sends no position command; it restores
-the previous goal, held command and grasp state only when the monitor is under five
-minutes old, the table and joints match, feedback is stationary and close, and the
-grip still has torque. This avoids dropping grip force during startup synchronization.
-Do not use resume after power cycling, moving the arm, or changing hardware.
+```bash
+llm-harness op home
+llm-harness op move_tool 0.30 0 0.125 --pitch -50
+llm-harness op move_tool 0.28 0 0.125 --pitch -60
+llm-harness op gripper open
+llm-harness op move_tool 0.28 0 0.035 --pitch -60
+llm-harness op gripper close
+llm-harness op nudge 0 0 0.06
+```
+
+Set heights with `move_tool` to an absolute z when you know where you want to be; a chain of relative nudges from a
+misremembered height ends somewhere else.
+
+## Results and what to do next
+
+| Status | What happened | What to do |
+|---|---|---|
+| `done` | the action finished; the numbers are measured. A tool move is done only within 10 mm and 3 deg of its target; `--json` gives how far off it ended under `result.error`. | look, then decide |
+| `rejected` | refused before anything moved | read the message: it names the rule and usually the fix. Change the request; repeating it gets the same answer. |
+| `stopped` | ended early: `op stop`, a joint more than 6 deg off its path (blocked, maybe by a collision), a measured point more than 10 mm under the floor or inside a keep-out zone, a motor over the temperature limit, a motion that did not arrive, a tool move that `ended X mm and Y deg from the target`, or a rest that ended without release. The arm holds where it is. | look at every camera before the next move. If it was blocked, find out by what. |
+| `fault` | an arm reports a fault | stop sending actions and tell the operator what you did and saw |
+
+Common rejections:
+
+| Message says | Do |
+|---|---|
+| `would move N deg in one action, over the 35 deg per-action limit` | split the motion: smaller position steps, or change the pitch by 20-30 deg at a time |
+| `that pose is out of reach (the closest reachable pose is ...)` | choose a closer point or another pitch |
+| `the straight path to that pose ends ... off it` | go through an intermediate point |
+| `... mm allowing for tracking error and sag), under the 0 mm hard floor. Aim higher.` | target a higher z |
+| `would bring the ... into keep-out zone NAME ... Go around it` | the path crosses a zone (`op describe` gives its corners): move away from it first, then approach the target from another side |
+| `inside keep-out zone NAME ... only motions that keep moving out of the zone` | the arm is already in the zone: move straight away from it first |
+| `under the 0 mm hard floor once tracking error and sag are allowed for ... only motions that keep gaining height` | the arm is already too low: lift first, `op nudge 0 0 0.02` |
+| `the motors turn on only at the rest pose` | the arm was moved while off: the operator folds it back to rest |
+| `no rest pose is recorded` | the operator runs `llm-harness calibrate --rest` |
+| `name the arm: left or right` | add `--arm left` or `--arm right` |
+| `a motor is at N C, over the 70 C limit` | `op wait 30` a few times, then try again |
+| `the table height is not known` | the operator has to run `llm-harness calibrate` |
+| `is outside its range [lo, hi] deg` | stay inside the range `op describe` lists |
+
+## Working within the envelope
+
+- One action may move no joint more than 35 deg from where it started (`home` and `rest` are exempt). Large tool moves
+  and large changes of pitch or yaw touch several joints at once: changing the pitch by more than about 20-30 deg in
+  one action tends to exceed the cap. Split them and look in between.
+- Turning the gripper far about its axis: `op move_joints wrist_roll=30 --relative`, repeated.
+- The hard floor (0 mm by default: the arm may touch the table) applies at every waypoint, not only at the end, to
+  the elbow and wrist joints, the tool point, the fingertips and the tips of the fully open jaws (`op describe` gives
+  both distances), whatever the gripper's actual opening. Pointing straight down the fingertips are lowest: a Metal
+  tool point comes down to about 25 mm above the table, a Maker one (pitch -45 to -70) to about 26-35 mm. A held
+  object and the links between those points are not checked. For a stricter envelope set `floor_margin_m`,
+  `floor_tolerance_deg` (every joint that far off its plan) and `sag_allowance_m` under `safety:`.
+- While moving, a joint more than 6 deg off its path, or a measured point more than 10 mm under the floor (pressing
+  into the table), stops the motion and the arm holds.
+- Keep-out zones (`op describe` lists each with its corners) are boxes no part of the arm may come within 30 mm of
+  at any point of a motion, from the base along the links to the fingers and open jaws. The observation's
+  `keep-out zone NAME D m away` shows how close the arm is. A refused path has to go around: move away from the
+  zone, then approach from another side. An arm already inside may only move out; entering one while moving holds
+  the arm.
+- Joints move at up to 20 deg/s, and at 5 deg/s when a motion starts or passes within 76 mm of the table.
+- An arm already under the floor accepts only motions that keep gaining height.
+- `rest` moves to the rest pose along a checked path, by way of `home` when the straight path would cross the floor.
+  When both are refused nothing moves: lift, then rest again. An arm with a fault is not moved.
+  The final approach to the recorded rest pose may go under the floor when the rest pose itself lies there, as long
+  as nothing on the way is lower than the rest pose and it runs at the slow speed.
+
+## Two arms
+
+Name the arm in every motion (`--arm left`). `observe`, `wait` and `rest` without `--arm` cover both arms; `rest`
+then rests each one. One action moves one arm; the other holds. The arms are not checked against each other: keep
+them apart, and move one away before the other works near it. Both arms share the world frame, so a target means the
+same point for either arm.
+
+```bash
+llm-harness op home --arm right
+llm-harness op move_tool 0.30 -0.25 0.50 --arm right
+llm-harness op rest
+```
+
+## Session control
+
+| Command | Effect |
+|---|---|
+| `llm-harness op status` | robot, arms, cameras, step count, run directory, whether an action is running; touches no device |
+| `llm-harness op describe` | the robot description |
+| `llm-harness op stop` | ends the action in progress and any sent while it ran; the arm holds where it is (`stopped`). Ctrl-C on a waiting `op` sends it too. |
+| `llm-harness rest` | every arm back to rest, motors off (`op rest --arm left` for one) |
+| `llm-harness op quit` | ends the session: the server rests the arms, then the command prints each arm's outcome (exit 1 when one is not confirmed off) |
+
+Finish a task with `llm-harness rest`, then report.
+
+## The episode log and taking over
+
+Every action is a line in `<home>/runs/<stamp>-<robot>/episode.jsonl` with its result and observation, and the images
+are next to it. To take over a task someone else started:
+
+```bash
+llm-harness log resume       # robot, task notes, step count, last five actions, last observation and images
+llm-harness log show         # every step: action -> result
+```
+
+Both read the latest run, or the run directory given as an argument. The operator can continue the same episode in
+a new session with `llm-harness serve --resume`; step numbers carry on.
+
+## When something is wrong
+
+- The images do not match the numbers: trust neither; `op observe` again, then ask the operator.
+- `no session is running`: the operator has to start `llm-harness serve` (or `sim`).
+- A camera line shows an error: carry on with the others only if they show what you need; tell the operator.
+- `stopped` with "blocked": something is in the way, or the arm is touching it. Look; back off with a small nudge
+  away from it.
+- A grasp reads near 0: the jaws missed. Open, lift a little, re-align, try again.
+- The same rejection twice: you are repeating the request. Change it.
+- `fault`: stop and report. Do not try to clear it with more actions.
+
+## Operator
+
+### Starting a session on a real robot
+
+```bash
+llm-harness robot check bench        # read-only: joints, torque, temperatures, faults, rest pose, cameras, calibration
+llm-harness calibrate --robot bench  # the table under each arm, then its folded rest pose
+llm-harness serve --robot bench
+```
+
+`robot check` prints per arm whether its motors are on, off or not known, how far it stands from its recorded rest
+pose, and the table height; it exits 1 and lists the problems when an arm reports a fault (torque left on by another
+program counts) or a camera gives no image. The images are in `<home>/checks/`. `serve --read-only` lets an agent look
+(`observe`, `wait`) without moving anything. `serve --address PATH` and `op --address PATH` run more than one session
+side by side; the socket's directory must belong to you and be closed to others (`chmod 700`).
+
+The arms are connected with their torque as it is. An arm's motors come on, holding its pose, with its first motion
+or gripper action that the envelope accepts, and only within 5 deg (every joint) of its recorded rest pose; a refused
+request leaves them off, and before the table is calibrated every action except `observe` and `wait` is refused.
+Keep the workspace clear and a hand on the hardware emergency stop while an agent drives.
+
+### Keep-out zones
+
+A keep-out zone is a box in the world frame that neither arm may enter, for things the arms must not hit: a camera
+mount between the arms, a wall, a fixture. The envelope keeps every point along each arm 30 mm
+(`keep_out_margin_m`) outside every box, so measure the object itself and let the margin do its work.
+
+Measure its corners in the world frame (with one arm at the default base, that arm's base frame: x forward, y left,
+z up, origin at the base):
+
+- With the arm: with the session stopped and the motors off, move the arm by hand until the closed fingertips touch
+  each extreme of the object (its lowest x, highest x, and so on) and run `llm-harness robot check bench`; it prints
+  the tool xyz. The fingertips reach past the tool point by the finger length (`op describe`), so add it along the
+  pointing direction.
+- With a tape measure: measure from the arm base's origin along its x and y axes; with two arms, add that arm's
+  `bases:` offset.
+
+Take the box a little larger than the object, up to its full height (a mount: from the table to above the highest
+reach of the arm), and add it:
+
+```bash
+llm-harness robot keep-out add camera_mount --min -0.10 -0.42 0 --max 0.20 -0.21 1.2 --robot bench
+```
+
+`robot check` then reports an arm or a recorded rest pose that lies inside a zone. An arm inside a zone may only move
+out of it, so a wrong box never traps an arm; `rest` may still end at a rest pose inside one.
+
+### Gripper geometry
+
+The envelope watches the fingertips and the tips of the open jaws at distances taken from a table per arm type
+(the README's safety section). They are estimates, not your tool: measure on the installed gripper how far the
+closed fingertips reach past the tool point along the pointing direction, and how far the fully open jaws reach to
+each side of it along their closing direction, and set them in the robot file before you calibrate:
+
+```yaml
+safety: {finger_length_m: 0.036, jaw_half_width_m: 0.074}
+```
+
+### Calibration
+
+The envelope needs the table height under each arm, in the world frame, and each arm's folded rest pose.
+`llm-harness calibrate` opens the robot read-only, and every reading needs the motors to confirm torque off (an arm
+whose torque is on or not known is refused: bring it down with the SDK first, `metal-arm rest --arm NAME`). For each
+arm in turn:
+
+1. Close the jaws, point the gripper down and move the arm by hand until the fingertips rest on the table. The arm
+   has no brakes: support it.
+2. Press Enter. Two readings 0.3 s apart must agree within 3 mm (three attempts); each needs fresh feedback from
+   every motor, the gripper pitched below -30 deg and the jaws closed (opening at most 0.1), or nothing is stored.
+3. The fingertip height is stored as that arm's table height in `<home>/calibration/<robot>.json`, together with the
+   arm's bus, profile, base pose and finger length; a change to any of them makes the arm uncalibrated again.
+4. Fold the arm back onto its rest support, as it should stand with the motors off, and answer `y`. Two readings
+   0.3 s apart must agree within 0.5 deg; a joint resting more than 5 deg past its limit is refused. The pose is
+   written to the robot file under `rest_q` (degrees).
+
+| Option | Use |
+|---|---|
+| `--arm left` | one arm only |
+| `--rest` | record only the rest pose (step 4) |
+| `--yes` | record the rest pose without asking whether the arm is folded and supported (for unattended use: it must already be) |
+| `--watch` | hands-free table touch: the reading is taken once the gripper has moved by more than 3 cm and then held still (within 3 mm) for 5 s; gives up after 8 minutes |
+| `--table-z Z` | store a known table height without opening the robot: the world-frame z (metres) where the fingertips touch the table. A value more than 0.5 m from the arm base's height is refused. |
+
+When the recorded rest pose lies under the floor for the measured table (within the hard floor once tracking error
+and sag are allowed for), `calibrate` and `robot check` say so. That is allowed: the arm starts in recovery mode, where
+it may only rise until it clears the floor, and `rest` may always end at the recorded rest pose, as long as no point of
+the way down is lower than the rest pose itself and it runs at the slow speed.
+
+Calibrate again when the table, an arm base, the gripper or the robot file's `bases:` change, and record the rest
+pose again when the rest support moves.
+
+### What happens on exit
+
+`op quit`, Ctrl-C or SIGTERM on `serve` stop taking requests, end the action in progress and any waiting, then rest
+every arm whose motors are on exactly as the `rest` action does: a checked path to the rest pose (by way of `home`
+when needed), and torque off once the arm stands within 5 deg of it, confirmed motor by motor. Further Ctrl-C or
+SIGTERM are ignored until that is over. `mcp` and `run` do the same when they end on a robot they opened, including
+on SIGTERM. Each prints `Every arm is at rest with its motors off.` and exits 0, or prints every arm's outcome and
+exits 1 when one is not confirmed off. Such an arm (a fault, a rest the envelope refused, a return that did not
+arrive, torque left on by another program) is not moved: it holds its pose with the motors on. On a terminal, `serve`
+keeps holding it and waits: Enter leaves it holding and ends the session, `RELEASE` (once it is supported) turns its
+torque off there. The printed command, `metal-arm rest --arm NAME --pose <its rest pose>` (or `maker-arm`), then brings
+it down and turns torque off; `release` would turn torque off where it is and drop it. `llm-harness serve --attach`
+instead takes over an arm left holding where it is, and `rest` brings it down along a checked path.
