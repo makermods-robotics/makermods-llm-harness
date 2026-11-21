@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from multiprocessing.connection import Client as connect, Listener
 
 import numpy as np
@@ -188,16 +189,19 @@ def test_default_address_lives_in_the_home(harness_home):
 
 
 # ── access, limits, cancellation and shutdown ──
-def test_the_socket_lives_in_a_directory_only_its_owner_can_enter(sim_harness, harness_home, tmp_path):
+def test_the_socket_lives_in_a_directory_only_its_owner_can_enter(sim_harness, monkeypatch, tmp_path):
     if FAMILY != "AF_UNIX":
         pytest.skip("named pipes have no directory")
+    home = Path(tempfile.mkdtemp(prefix="lh"))     # short enough for the default socket path
+    monkeypatch.setenv("LLM_HARNESS_HOME", str(home))
     server = Server(sim_harness())
     try:
-        folder = harness_home / "session"
+        folder = home / "session"
         assert stat.S_IMODE(folder.stat().st_mode) == 0o700
         assert stat.S_IMODE(os.stat(server.address).st_mode) == 0o600
     finally:
         server.shutdown()
+        shutil.rmtree(home, ignore_errors=True)
     shared = tmp_path / "shared"
     shared.mkdir(mode=0o777)
     os.chmod(shared, 0o777)

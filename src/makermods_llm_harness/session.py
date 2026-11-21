@@ -124,7 +124,9 @@ class Server:
         if FAMILY == "AF_UNIX":
             _private_dir(self.address)
         ensure_free(self.address)
-        self._listener = Listener(self.address, family=FAMILY)
+        # macOS refuses a Unix socket connection outright once the backlog is full (Linux makes it wait),
+        # so the backlog covers a burst of clients while the accept loop is busy.
+        self._listener = Listener(self.address, family=FAMILY, backlog=MAX_CLIENTS)
         if FAMILY == "AF_UNIX":
             os.chmod(self.address, 0o600)
         self._closing = threading.Event()

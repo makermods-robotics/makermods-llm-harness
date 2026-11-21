@@ -492,7 +492,7 @@ def test_sigterm_rests_the_arms_and_reports_each_outcome(capsys):
     h = Harness.open(backend=sim_backend(cameras=()))
     assert h.step({"action": "home"}).result.ok
     with cli.Lifecycle(h) as life:
-        os.kill(os.getpid(), signal.SIGTERM)
+        signal.raise_signal(signal.SIGTERM)
         time.sleep(1)
         pytest.fail("SIGTERM did not end the block")
     assert life.interrupted and life.outcomes == {"arm": "released"} and life.code == 0

@@ -85,11 +85,11 @@ def test_step_limit(sim_harness):
 
 def test_timeout(sim_harness):
     def slow(messages):
-        time.sleep(0.05)
+        time.sleep(0.8)
         return act({"action": "observe"})
 
-    result = agent.run(sim_harness(), "look", provider=Scripted(*[slow] * 10), timeout_s=0.12, say=lambda line: None)
-    assert result.status == "timeout" and 1 <= result.steps <= 3
+    result = agent.run(sim_harness(), "look", provider=Scripted(*[slow] * 10), timeout_s=2.0, say=lambda line: None)
+    assert result.status == "timeout" and 1 <= result.steps <= 3     # each model turn takes at least 0.8 s
 
 
 def test_a_fault_stops_the_actions_and_the_model_reports(sim_harness):
