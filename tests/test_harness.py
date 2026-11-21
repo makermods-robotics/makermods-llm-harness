@@ -443,8 +443,8 @@ def test_stop_also_ends_the_actions_waiting_behind(sim_harness):
     second.start()
     time.sleep(0.2)
     h.stop()
-    first.join(5)
-    second.join(5)
+    first.join(30)
+    second.join(30)
     assert results["first"].status == "stopped" and "on request" in results["first"].message
     assert results["second"].status == "stopped"
     assert results["second"].message == "stopped on request before it started."

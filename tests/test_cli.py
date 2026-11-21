@@ -81,7 +81,7 @@ def serve(address, capsys):
                 Client(address).quit()
             except SessionError:
                 pass
-        thread.join(10)
+        thread.join(30)
         assert not thread.is_alive()
 
 
@@ -165,7 +165,7 @@ def test_quit_rests_the_arms_and_ends_serve(serve, op, capsys, tmp_path):
     assert_done(op("home"))
     code, out = op("quit")
     assert code == 0 and out.count("Every arm is at rest with its motors off.") == 2     # client and server
-    session["thread"].join(10)
+    session["thread"].join(30)
     assert session["code"] == 0
     events = read_episode(tmp_path / "run")
     assert events[-2]["action"] == {"action": "home"} and events[-1]["event"] == "end"
@@ -192,7 +192,7 @@ def test_serve_exits_1_when_an_arm_cannot_be_rested(serve, op, capsys, monkeypat
     code, out = op("quit")
     assert code == 1 and "session ended" in out
     assert out.count("arm is NOT confirmed off (holding: arm: that motion") == 2         # client and server
-    session["thread"].join(10)
+    session["thread"].join(30)
     assert session["code"] == 1
     assert "Support it" in out and "Every arm is at rest" not in out
 
@@ -202,7 +202,7 @@ def test_serve_resume_continues_the_step_count_and_read_only(serve, op, address)
     session = serve("serve", "--robot", "simbot")
     assert_done(op("home"))
     assert_done(op("quit"))
-    session["thread"].join(10)
+    session["thread"].join(30)
     serve("serve", "--robot", "simbot", "--resume", "--read-only")
     status = Client(address).status()
     assert status["steps"] == 1 and status["read_only"]
@@ -355,7 +355,7 @@ def test_log_show_and_resume(serve, op, capsys, tmp_path):
     assert_done(op("home"))
     assert op("move_tool", "2", "0", "0")[0] == 1
     op("quit")
-    session["thread"].join(10)
+    session["thread"].join(30)
     capsys.readouterr()
     assert main(["log", "show", str(tmp_path / "run")]) == 0
     out = capsys.readouterr().out

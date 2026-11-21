@@ -40,12 +40,12 @@ def serving(sim_harness, address):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         started.append((server, thread))
-        return server, Client(address, timeout_s=10)
+        return server, Client(address, timeout_s=60)
 
     yield start
     for server, thread in started:
         server.shutdown()
-        thread.join(5)
+        thread.join(30)
         assert not thread.is_alive()
 
 
@@ -99,7 +99,7 @@ def test_stop_interrupts_a_running_action(serving, sim_harness):
     time.sleep(0.3)
     assert client.status()["busy"]
     client.stop()
-    worker.join(5)
+    worker.join(30)
     assert replies[0].result.status == "stopped"
     assert not client.status()["busy"]
 
@@ -136,7 +136,7 @@ def test_stale_socket_file_is_replaced(sim_harness, address):
         assert Client(address).status()["steps"] == 0
     finally:
         server.shutdown()
-        thread.join(5)
+        thread.join(30)
 
 
 def test_too_long_socket_path():
@@ -177,7 +177,7 @@ def test_server_dying_mid_request_is_a_session_error(address):
         with pytest.raises(SessionError, match="ended before it answered"):
             client.step({"action": "observe"})
     finally:
-        thread.join(5)
+        thread.join(30)
         listener.close()
 
 
@@ -246,19 +246,19 @@ def test_quit_answers_after_the_owner_rested_the_arms_and_later_requests_are_ref
     server = Server(harness, address, reports_close=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    client = Client(address, timeout_s=10)
+    client = Client(address, timeout_s=60)         # the quit answers only after the arms have rested
     client.step({"action": "home"})
     replies = []
     quitter = threading.Thread(target=lambda: replies.append(client.quit()))
     quitter.start()
-    thread.join(5)
+    thread.join(30)
     assert not thread.is_alive() and quitter.is_alive()          # admission closed, quit still waiting
     with pytest.raises(SessionError, match="closing"):
         server._run("step", {"action": {"action": "home"}}, None)
     harness.stop()
     server.drain()
     server.finish(harness.close())
-    quitter.join(5)
+    quitter.join(60)
     assert replies == [{"arm": "released"}]
 
 

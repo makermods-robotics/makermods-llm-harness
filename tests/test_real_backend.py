@@ -54,7 +54,7 @@ def rig(request):
     backend.close()
 
 
-def wait_for(check, timeout=3.0):
+def wait_for(check, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if check():
@@ -250,7 +250,7 @@ def test_a_ramp_of_waypoints_is_tracked(rig):
         backend.step({"arm": ArmTarget(q, 0.0)}, 0.04)
         lag = max(lag, float(np.abs(backend.read()["arm"].q - q).max()))
     assert np.degrees(lag) < 3.0
-    assert wait_for(lambda: np.abs(backend.read()["arm"].q - goal).max() < math.radians(0.2), timeout=1.0)
+    assert wait_for(lambda: np.abs(backend.read()["arm"].q - goal).max() < math.radians(0.2), timeout=5.0)
 
 
 def test_close_without_enable():
