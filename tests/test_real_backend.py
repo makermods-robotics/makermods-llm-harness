@@ -448,7 +448,7 @@ def test_an_arm_left_energized_is_attached_and_rested(kind):
     model = ArmModel(ArmInfo("arm", kind))
     first.connect()
     first.enable()
-    assert first.move_to(list(model.home_q) + first.get_joint_positions()[6:], speed=3.0)
+    assert first.move_to(list(model.home_q) + first.get_joint_positions()[6:], speed=3.0, timeout=10.0)
     first.detach()
     sim.watchdog_timeout("gripper")
     held = np.array(sim.positions[:6])
