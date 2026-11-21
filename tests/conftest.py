@@ -3,7 +3,12 @@ kinematic simulator and closes them afterwards."""
 
 from __future__ import annotations
 
-import pytest
+import os
+
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")   # small matrices: idle BLAS threads only take CPU from
+os.environ.setdefault("OMP_NUM_THREADS", "1")        # the control loops
+
+import pytest  # noqa: E402
 
 from makermods_llm_harness import Harness
 from makermods_llm_harness import robot as robots

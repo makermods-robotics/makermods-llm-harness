@@ -78,11 +78,15 @@ class EpisodeLog:
                 self._file = None
 
 
+WINDOWS_LOCK_OFFSET = 0x7FFFFFF0   # bytes; the C runtime's lock offsets are 32-bit
+
+
 def _lock(file) -> None:
     """An exclusive, non-blocking lock on an open file, released when it closes."""
     if os.name == "nt":
         import msvcrt
-        file.seek(0)
+        # Windows locks are mandatory: the locked byte lies past any episode's length so readers are not blocked.
+        file.seek(WINDOWS_LOCK_OFFSET)
         msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
     else:
         import fcntl

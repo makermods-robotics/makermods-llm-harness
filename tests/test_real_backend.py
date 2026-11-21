@@ -260,19 +260,23 @@ def test_close_without_enable():
     backend.close()
 
 
-def test_step_keeps_a_steady_period():
+def test_step_keeps_a_steady_period(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    clock.monotonic = lambda: clock.now
+    clock.sleep = lambda s: setattr(clock, "now", clock.now + s)
+    monkeypatch.setattr("makermods_llm_harness.backends.real.time", clock)
     arm, _ = importlib.import_module("metal_arm.testing").simulated_arm()
     backend = RealBackend("metal", {}, {}, [ArmInfo("arm")], arms={"arm": arm})
     try:
-        start = time.monotonic()
+        start = clock.now
         for _ in range(10):
             backend.step({}, 0.02)
-            time.sleep(0.005)               # work between steps is absorbed by the period
-        assert 0.19 <= time.monotonic() - start < 0.5
-        time.sleep(0.1)                     # late by several periods: the schedule restarts
-        start = time.monotonic()
+            clock.now += 0.005              # work between steps is absorbed by the period
+        assert clock.now - start == pytest.approx(0.205)
+        clock.now += 0.1                    # late by several periods: the schedule restarts
+        start = clock.now
         backend.step({}, 0.02)
-        assert 0.015 <= time.monotonic() - start < 0.1
+        assert clock.now - start == pytest.approx(0.02)
     finally:
         backend.close()
 
