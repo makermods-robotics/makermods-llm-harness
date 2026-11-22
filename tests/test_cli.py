@@ -448,6 +448,18 @@ def test_calibrate_refuses_unconfirmed_torque_open_jaws_and_lost_feedback(tmp_pa
     assert load_calibration("bench") == {}
 
 
+def test_calibrate_takes_the_operators_word_only_when_the_motors_cannot_report_torque(tmp_path, monkeypatch):
+    assert main(["robot", "init", "bench", "--arm", "metal", "--from-rig", str(write_rig(tmp_path))]) == 0
+    sim = HandHeld(robots_arms("bench"), cameras=())
+    monkeypatch.setattr(Robot, "open_backend", lambda self: sim)
+    sim.torque = True
+    with pytest.raises(cli.CalibrationError, match="torque is on"):
+        cli.calibrate(load_robot("bench"), ["left"], motors_off=True, ask=lambda prompt: "y", say=lambda line: None)
+    sim.torque = None
+    cli.calibrate(load_robot("bench"), ["left"], motors_off=True, ask=lambda prompt: "y", say=lambda line: None)
+    assert "left" in load_calibration("bench") and "left" in load_robot("bench").rest_q
+
+
 def robots_arms(name):
     return load_robot(name).arm_infos()
 

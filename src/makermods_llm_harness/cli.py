@@ -494,30 +494,34 @@ def cmd_keep_out(args) -> int:
 
 
 # ── calibrate ──
-def _sample(harness: Harness, arm: str) -> ArmState:
-    """One fresh reading of an arm guided by hand: no fault, every joint read, torque confirmed off."""
+def _sample(harness: Harness, arm: str, motors_off: bool = False) -> ArmState:
+    """One fresh reading of an arm guided by hand: no fault, every joint read, torque confirmed off.
+    ``motors_off`` is the operator's word that they are off, for motors that do not report it."""
     state = harness.backend.read()[arm]
     if state.fault:
         raise CalibrationError(f"{arm}: {state.fault}")
     if not np.all(np.isfinite(state.q)):
         raise CalibrationError(f"{arm}: no joint feedback")
-    if state.enabled is not False:
+    if state.enabled is not False and not (motors_off and state.enabled is None):
         recovery = getattr(harness.backend, "recovery", None)
         how = recovery(arm) if recovery else "Turn its motors off"
         raise CalibrationError(f"{arm}: its torque is {'on' if state.enabled else 'not confirmed off'}, and a reading "
-                               f"taken by hand needs the motors off. {how}, then try again")
+                               f"taken by hand needs the motors off. {how}, then try again"
+                               + ("" if state.enabled else " (motors that cannot report their torque: check by hand "
+                                                           "that the arm moves freely, then add --motors-off)"))
     return state
 
 
-def _touch_table(harness: Harness, robot: robots.Robot, arm: str, watch: bool, ask, say) -> float:
+def _touch_table(harness: Harness, robot: robots.Robot, arm: str, watch: bool, ask, say,
+                 motors_off: bool = False) -> float:
     model = harness.models[arm]
 
     def read_z() -> float:
-        return float(model.fingertip(_sample(harness, arm).q)[2])
+        return float(model.fingertip(_sample(harness, arm, motors_off).q)[2])
 
     def read_touch() -> float:
         """The fingertip height, from a sample that also shows the gripper pointing down with its jaws closed."""
-        state = _sample(harness, arm)
+        state = _sample(harness, arm, motors_off)
         pitch = math.degrees(model.tool_angles(state.q)[1])
         if pitch > MAX_TOUCH_PITCH_DEG:
             raise CalibrationError(f"{arm}: the gripper points {pitch:.0f} deg from horizontal; the fingertips are "
@@ -535,15 +539,16 @@ def _touch_table(harness: Harness, robot: robots.Robot, arm: str, watch: bool, a
     return z
 
 
-def _record_rest(harness: Harness, robot: robots.Robot, arm: str, yes: bool, ask, say) -> list[float]:
+def _record_rest(harness: Harness, robot: robots.Robot, arm: str, yes: bool, ask, say,
+                 motors_off: bool = False) -> list[float]:
     model = harness.models[arm]
     say(f"Arm {arm}: fold it into its rest pose, resting on its support, motors off.")
     if not yes and ask(f"Is {arm} folded in its rest pose and resting on its support? [y/N] ").strip().lower() \
             not in ("y", "yes"):
         raise CalibrationError(f"{arm}: no rest pose recorded")
-    first = _sample(harness, arm).q
+    first = _sample(harness, arm, motors_off).q
     time.sleep(REST_GAP_S)
-    q = _sample(harness, arm).q
+    q = _sample(harness, arm, motors_off).q
     if np.max(np.abs(q - first)) > math.radians(REST_STILL_DEG):
         raise CalibrationError(f"{arm}: the arm moved while it was read; let it rest still, then try again")
     past = np.maximum(model.lo - q, q - model.hi)
@@ -561,19 +566,19 @@ def _record_rest(harness: Harness, robot: robots.Robot, arm: str, yes: bool, ask
 
 
 def calibrate(robot: robots.Robot, arms: Sequence[str], watch: bool = False, table: bool = True,
-              rest: bool = True, yes: bool = False, ask: Callable[[str], str] = input,
-              say: Callable[[str], None] = print) -> dict[str, float]:
+              rest: bool = True, yes: bool = False, motors_off: bool = False,
+              ask: Callable[[str], str] = input, say: Callable[[str], None] = print) -> dict[str, float]:
     """For each arm: measure the table by touching it with the fingertips and store it (``table``), then
     record its folded rest pose (``rest``; ``yes`` skips the question whether it is folded and supported).
     The robot is opened read-only: the arms stay off, moved by hand, and every reading needs torque off
-    confirmed."""
+    confirmed by the motors, or stated by the operator (``motors_off``) for motors that do not report it."""
     heights = {}
     with Harness.open(robot, read_only=True) as harness:
         for arm in arms:
             if table:
-                heights[arm] = _touch_table(harness, robot, arm, watch, ask, say)
+                heights[arm] = _touch_table(harness, robot, arm, watch, ask, say, motors_off)
             if rest:
-                _record_rest(harness, robot, arm, yes, ask, say)
+                _record_rest(harness, robot, arm, yes, ask, say, motors_off)
             table_z = heights.get(arm, harness.envelopes[arm].table_z)
             if arm in robot.rest_q:
                 note = Envelope(harness.models[arm], harness.config, table_z).rest_note(np.radians(robot.rest_q[arm]))
@@ -599,7 +604,7 @@ def cmd_calibrate(args) -> int:
             path = save_calibration(robot.name, arm, args.table_z, robot.setup(arm))
             print(f"{arm}: stored table z = {args.table_z:.4f} m (world frame) in {path}")
         return 0
-    calibrate(robot, arms, watch=args.watch, table=not args.rest, yes=args.yes)
+    calibrate(robot, arms, watch=args.watch, table=not args.rest, yes=args.yes, motors_off=args.motors_off)
     return 0
 
 
@@ -748,6 +753,8 @@ def build_parser() -> _Parser:
     how.add_argument("--rest", action="store_true", help="record only the folded rest pose, not the table")
     q.add_argument("--yes", action="store_true",
                    help="record the rest pose without asking whether the arm is folded and supported")
+    q.add_argument("--motors-off", action="store_true",
+                   help="state that the motors are off, for an arm whose motors do not report their torque")
     q.set_defaults(func=cmd_calibrate)
 
     q = sub.add_parser("serve", parents=[session], help="hold a robot open as a session for `op` commands")

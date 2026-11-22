@@ -334,6 +334,7 @@ arm in turn:
 | `--arm left` | one arm only |
 | `--rest` | record only the rest pose (step 4) |
 | `--yes` | record the rest pose without asking whether the arm is folded and supported (for unattended use: it must already be) |
+| `--motors-off` | state that the motors are off, for an arm whose motors do not report their torque (older RobStride firmware). Check by hand that the arm moves freely first; motors that report torque on are still refused. |
 | `--watch` | hands-free table touch: the reading is taken once the gripper has moved by more than 3 cm and then held still (within 3 mm) for 5 s; gives up after 8 minutes |
 | `--table-z Z` | store a known table height without opening the robot: the world-frame z (metres) where the fingertips touch the table. A value more than 0.5 m from the arm base's height is refused. |
 
