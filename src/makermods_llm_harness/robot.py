@@ -37,7 +37,7 @@ from .backends.base import ARM_TYPES, ArmInfo, Backend
 
 BACKENDS = ("real", "sim", "mujoco")
 SIM_BACKENDS = ("sim", "mujoco")
-KEYS = ("backend", "arm", "arms", "bases", "cameras", "rest_q", "safety", "keep_out", "scene")
+KEYS = ("backend", "arm", "arms", "bases", "cameras", "rest_q", "safety", "keep_out", "scene", "home")
 OBJECT_KEYS = ("name", "xyz", "size", "color")
 
 
@@ -82,6 +82,7 @@ class Robot:
     scene: dict = field(default_factory=dict)
     path: Optional[Path] = None
     keep_out: list[dict] = field(default_factory=list)
+    home: dict = field(default_factory=dict)     # the pose `home` goes to: {xyz: [x, y, z] in the arm's base frame, pitch: deg}
 
     @classmethod
     def from_dict(cls, name: str, raw: dict, path: Optional[Path] = None) -> "Robot":
@@ -100,7 +101,7 @@ class Robot:
                     {str(k): str(v or "") for k, v in cameras.items()},
                     {str(k): v for k, v in (raw.get("rest_q") or {}).items()},
                     dict(raw.get("safety") or {}), dict(raw.get("scene") or {}), path,
-                    raw.get("keep_out") or [])
+                    raw.get("keep_out") or [], dict(raw.get("home") or {}))
         robot.validate()
         return robot
 
@@ -118,6 +119,8 @@ class Robot:
             out["keep_out"] = [z.to_dict() for z in self.zones()]
         if self.scene:
             out["scene"] = dict(self.scene)
+        if self.home:
+            out["home"] = dict(self.home)
         return out
 
     def validate(self) -> None:

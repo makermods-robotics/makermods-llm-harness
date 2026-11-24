@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from multiprocessing.connection import Client as connect, Listener
+from multiprocessing.connection import Listener
 
 import numpy as np
 import pytest
@@ -17,6 +17,12 @@ from makermods_llm_harness.actions import Home, Observation
 from makermods_llm_harness.session import FAMILY, Client, Server, SessionError, default_address
 
 from conftest import sim_backend
+
+
+def authed(address):
+    """A raw connection that has answered the session's challenge."""
+    from makermods_llm_harness.session import _open, _read_key
+    return _open(address, _read_key(address))
 
 
 @pytest.fixture
@@ -46,6 +52,7 @@ def serving(sim_harness, address):
     for server, thread in started:
         server.shutdown()
         thread.join(30)
+        server.release()
         assert not thread.is_alive()
 
 
@@ -62,7 +69,8 @@ def test_round_trips(serving, tmp_path):
     assert "Robot robot" in client.describe()
     status = client.status()
     assert status == {"robot": "robot", "arms": ["arm"], "cameras": ["top", "side"], "steps": 3, "run_dir": None,
-                      "read_only": False, "busy": False}
+                      "read_only": False, "busy": False, "queue": {"running": None, "waiting": []},
+                      "kernel": FAMILY != "AF_PIPE"}
     assert client.rest().result.ok
     client.quit()
     deadline = time.monotonic() + 5
@@ -116,6 +124,7 @@ def test_second_server_is_refused_and_a_stale_socket_is_reused(serving, sim_harn
     if FAMILY != "AF_UNIX":
         return
     server.shutdown()
+    server.release()
     time.sleep(0.2)
     open(address, "w").close()      # a regular file is not taken for a stale socket
     with pytest.raises(SessionError, match="not a socket"):
@@ -149,7 +158,7 @@ def test_too_long_socket_path():
 def test_malformed_requests_and_harness_errors_get_error_replies(serving, monkeypatch):
     server, client = serving()
     for raw in (b"not json", b"[1]", json.dumps({"op": "fly"}).encode(), json.dumps({"op": "step"}).encode()):
-        conn = connect(server.address, family=FAMILY)
+        conn = authed(server.address)
         conn.send_bytes(raw)
         reply = json.loads(conn.recv_bytes())
         conn.close()
@@ -162,11 +171,19 @@ def test_malformed_requests_and_harness_errors_get_error_replies(serving, monkey
 
 
 def test_server_dying_mid_request_is_a_session_error(address):
+    from makermods_llm_harness.session import CHALLENGE, key_path
+    key_path(address).write_bytes(b"k" * 32)
     listener = Listener(address, family=FAMILY)
 
-    def answer_then_die():
-        listener.accept().close()            # the client's connection check
+    def challenged():
         conn = listener.accept()
+        conn.send_bytes(CHALLENGE + b"x" * 32)
+        conn.recv_bytes()
+        return conn
+
+    def answer_then_die():
+        challenged().close()                 # the client's connection check
+        conn = challenged()
         conn.recv_bytes()
         conn.close()                         # gone before it answers
 
@@ -213,7 +230,7 @@ def test_an_oversized_request_is_refused_and_the_server_goes_on(serving, monkeyp
     import makermods_llm_harness.session as session
     monkeypatch.setattr(session, "MAX_REQUEST", 1000)
     server, client = serving()
-    conn = connect(server.address, family=FAMILY)
+    conn = authed(server.address)
     conn.send_bytes(json.dumps({"op": "step", "action": {"action": "observe", "pad": "x" * 5000}}).encode())
     with pytest.raises((EOFError, OSError)):
         conn.recv_bytes()
@@ -223,7 +240,7 @@ def test_an_oversized_request_is_refused_and_the_server_goes_on(serving, monkeyp
 
 def test_a_client_that_hangs_up_cancels_its_motion(serving, sim_harness):
     server, client = serving(sim_harness(backend=sim_backend(realtime=True)))
-    conn = connect(server.address, family=FAMILY)
+    conn = authed(server.address)
     conn.send_bytes(json.dumps({"op": "step", "action": {"action": "home"}}).encode())
     time.sleep(0.3)
     assert client.status()["busy"]
@@ -253,7 +270,7 @@ def test_quit_answers_after_the_owner_rested_the_arms_and_later_requests_are_ref
     quitter.start()
     thread.join(30)
     assert not thread.is_alive() and quitter.is_alive()          # admission closed, quit still waiting
-    with pytest.raises(SessionError, match="closing"):
+    with pytest.raises(SessionError, match="shutting down"):
         server._run("step", {"action": {"action": "home"}}, None)
     harness.stop()
     server.drain()

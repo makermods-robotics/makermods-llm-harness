@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from makermods_llm_harness.log import EpisodeBusy, EpisodeLog, latest_run, new_run_dir, read_episode, summary
@@ -97,3 +99,84 @@ def test_one_writer_at_a_time_and_paths_are_absolute(tmp_path, monkeypatch):
         EpisodeLog.resume("run")
     log.close()
     EpisodeLog.resume("run").close()
+
+
+def test_profile_splits_an_episode_into_steps_and_idle_gaps(tmp_path, capsys):
+    from makermods_llm_harness import cli
+    from makermods_llm_harness.log import profile
+
+    run = tmp_path / "run"
+    run.mkdir()
+    events = [
+        {"event": "start", "time": 100.0, "robot": "bench", "arms": ["arm"]},
+        {"event": "action", "time": 102.0, "step": 1, "action": {"action": "home"}},
+        {"event": "step", "time": 106.0, "step": 1, "action": {"action": "home"},
+         "observation": {"result": {"status": "done"}}},
+        {"event": "py", "time": 107.5, "seconds": 0.5, "chars": 40, "error": False},
+        {"event": "action", "time": 110.0, "step": 2, "action": {"action": "move_tool"}},
+        {"event": "step", "time": 110.1, "step": 2, "action": {"action": "move_tool"},
+         "observation": {"result": {"status": "rejected"}}},
+        {"event": "step", "time": 111.0, "step": 3, "action": None, "observation": {"result": {"status": "rejected"}}},
+        {"event": "action", "time": 111.0, "step": 4, "action": {"action": "nudge"}},
+        {"event": "step", "time": 114.0, "step": 4, "action": {"action": "nudge"},
+         "observation": {"result": {"status": "done"}}},
+        {"event": "kernel_action", "time": 114.1, "id": 1, "name": "grasp", "status": "done", "seconds": 3.0},
+        {"event": "end", "time": 120.0},
+    ]
+    (run / "episode.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    p = profile(run)
+    assert p["wall_s"] == 20.0 and p["in_steps_s"] == pytest.approx(7.1)
+    assert p["motion_s"] == pytest.approx(7.0) and p["refused_s"] == pytest.approx(0.1)
+    assert p["between_s"] == pytest.approx(2.0 + 4.0 + 0.9 + 6.0) and p["after_last_s"] == pytest.approx(6.0)
+    assert p["in_steps_s"] + p["between_s"] + p["between_sessions_s"] + p["shutdown_s"] == pytest.approx(p["wall_s"])
+    assert [(s["step"], s["seconds"], s["gap_s"]) for s in p["steps"]] == [
+        (1, 4.0, 2.0), (2, 0.1, 4.0), (3, 0.0, 0.9), (4, 3.0, 0.0)]
+    assert p["statuses"] == {"done": 2, "rejected": 2} and p["by_action"]["home"] == {"count": 1, "seconds": 4.0}
+    assert p["py_calls"] == 1 and p["kernel_actions"] == [{"id": 1, "name": "grasp", "status": "done", "seconds": 3.0}]
+    assert cli.main(["log", "profile", str(run)]) == 0
+    out = capsys.readouterr().out
+    assert "4 steps over 20.0 s" in out and "longest gaps: 4.0 s before step 2" in out and "#1 grasp" in out
+    assert cli.main(["log", "profile", str(run), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["wall_s"] == 20.0
+
+
+def test_profile_counts_the_time_between_resumed_sessions_apart(tmp_path):
+    from makermods_llm_harness.log import profile
+
+    run = tmp_path / "run"
+    run.mkdir()
+    events = [
+        {"event": "start", "time": 0.0},
+        {"event": "action", "time": 1.0, "step": 1, "action": {"action": "home"}},
+        {"event": "step", "time": 3.0, "step": 1, "action": {"action": "home"},
+         "observation": {"result": {"status": "done"}}},
+        {"event": "end", "time": 4.0},
+        {"event": "start", "time": 1004.0},
+        {"event": "action", "time": 1005.0, "step": 2, "action": {"action": "nudge"}},
+        {"event": "step", "time": 1006.0, "step": 2, "action": {"action": "nudge"},
+         "observation": {"result": {"status": "done"}}},
+    ]
+    (run / "episode.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    p = profile(run)
+    assert p["sessions"] == 2 and p["between_sessions_s"] == pytest.approx(1000.0)
+    assert p["in_steps_s"] == pytest.approx(3.0) and p["between_s"] == pytest.approx(1 + 1 + 1)
+    assert p["in_steps_s"] + p["between_s"] + p["between_sessions_s"] + p["shutdown_s"] == pytest.approx(p["wall_s"])
+
+
+def test_profile_counts_the_shutdown_rest_apart_from_idle_time(tmp_path):
+    from makermods_llm_harness.log import profile
+
+    run = tmp_path / "run"
+    run.mkdir()
+    events = [
+        {"event": "start", "time": 0.0},
+        {"event": "action", "time": 1.0, "step": 1, "action": {"action": "home"}},
+        {"event": "step", "time": 2.0, "step": 1, "action": {"action": "home"},
+         "observation": {"result": {"status": "done"}}},
+        {"event": "closing", "time": 5.0},
+        {"event": "end", "time": 9.0},
+    ]
+    (run / "episode.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    p = profile(run)
+    assert p["shutdown_s"] == pytest.approx(4.0) and p["after_last_s"] == pytest.approx(3.0)
+    assert p["in_steps_s"] + p["between_s"] + p["between_sessions_s"] + p["shutdown_s"] == pytest.approx(p["wall_s"])

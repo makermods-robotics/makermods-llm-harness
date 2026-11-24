@@ -2,6 +2,7 @@
 provider is tested against the real SDK with a mock HTTP transport."""
 
 import copy
+from pathlib import Path
 import json
 import threading
 import time
@@ -11,6 +12,7 @@ import pytest
 
 from makermods_llm_harness import agent, tools
 from makermods_llm_harness.agent import AnthropicProvider, Reply, ToolCall
+from makermods_llm_harness.kernel import TOOL
 
 from conftest import APPROACH, GRASP_PITCH, GRASP_Z, sim_backend
 
@@ -222,3 +224,130 @@ def test_anthropic_refusal_and_missing_key(mock_api, monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         AnthropicProvider(client=make()).complete("s", [{"role": "user", "content": []}], [])
     assert len(sent) == 1
+
+
+def test_the_model_queues_actions_in_the_kernel_and_gets_their_reports(served):
+    server, client = served()
+    h = server.harness
+    code = "def home(r):\n    r.home()\ndef lower(r):\n    r.nudge([0, 0, -0.05])\nkernel.queue([home, lower])"
+    provider = Scripted(Reply(tool_calls=[ToolCall("py-1", "run_python", {"code": code})]),
+                        Reply("Queued; waiting."), Reply("Waiting for the last one."), Reply("Done."))
+
+    lines = []
+    result = agent.run(client, "home then lower", provider=provider, say=lines.append)
+    assert result.status == "done" and result.steps == 1 and lines[0].startswith("[1] run_python -> ok")
+    assert "kernel.queue" in provider.requests[0][0] and provider.requests[0][2] == tools() + [TOOL]
+    delivered = "\n".join(p["text"] for _, messages, _ in provider.requests for m in messages if m["role"] == "user"
+                          for p in m["content"] if p["type"] == "text")
+    assert "[action #1 home] done" in delivered and "[action #2 lower] done" in delivered
+    assert h.state().arms["arm"].tool.xyz[2] == pytest.approx(0.531, abs=2e-3)
+
+
+def test_a_run_that_ends_abnormally_stops_what_it_queued(served, tmp_path):
+    server, client = served()
+    gate = tmp_path / "never"
+    code = (f"import os, time\ndef waits(r):\n    r.home()\n    while not os.path.exists({str(gate)!r}):\n"
+            "        time.sleep(0.01)\nkernel.queue(waits)")
+
+    def fails(messages):
+        deadline = time.monotonic() + 60
+        while client.status()["queue"]["running"] is None:      # the action runs when the provider fails
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        raise RuntimeError("provider down")
+
+    provider = Scripted(Reply(tool_calls=[ToolCall("py-1", "run_python", {"code": code})]), fails)
+    with pytest.raises(RuntimeError, match="provider down"):
+        agent.run(client, "home", provider=provider, say=lambda line: None)
+    status = client.status()["queue"]
+    reports = client.py("", wait_s=30)["reports"]
+    assert status["waiting"] == [] and [(r["name"], r["status"]) for r in reports] == [("waits", "stopped")]
+
+
+def test_a_stopped_kernel_call_skips_the_rest_of_its_batch(served):
+    server, client = served()
+    provider = Scripted(Reply(tool_calls=[ToolCall("py-1", "run_python", {"code": "kernel.stop()"}),
+                                          ToolCall("call-2", "home", {})]), Reply("Stopped."))
+    result = agent.run(client, "home", provider=provider, say=lambda line: None)
+    assert result.status == "done" and result.steps == 1
+    skipped = tool_results(provider.requests[-1][1])[-1]["content"][0]["text"]
+    assert skipped.startswith("not run: ") and not server.harness.state().arms["arm"].enabled
+
+
+def test_a_motion_that_did_not_end_done_in_a_call_skips_the_rest_of_its_batch(served):
+    server, client = served()
+    client.step({"action": "home"})
+    server.harness.backend.block("arm")
+    code = "r.move_joints({'wrist_roll': 20}, relative=True)"
+    provider = Scripted(Reply(tool_calls=[ToolCall("py-1", "run_python", {"code": code}),
+                                          ToolCall("call-2", "gripper", {"opening": 1})]), Reply("Blocked."))
+    result = agent.run(client, "turn", provider=provider, say=lambda line: None)
+    assert result.steps == 1
+    assert tool_results(provider.requests[-1][1])[-1]["content"][0]["text"].startswith("not run: ")
+    assert server.harness.state().arms["arm"].gripper < 0.05
+
+
+def test_cleanup_stops_only_the_runs_own_work_and_reports_a_failure(served, tmp_path, monkeypatch):
+    server, client = served()
+    gate = tmp_path / "never"
+    others = (f"import os, time\ndef theirs(r):\n    while not os.path.exists({str(gate)!r}):\n"
+              "        time.sleep(0.01)\nkernel.queue(theirs)")
+    client.py(others)                                         # queued by someone else
+    provider = Scripted(Reply("Nothing to do."))
+    monkeypatch.setattr(agent, "_loop", lambda *a, **k: agent.RunResult("step_limit", 0, "limit"))
+    result = agent.run(client, "x", provider=provider, say=lambda line: None)
+    assert result.status == "step_limit" and client.status()["queue"]["running"]["name"] == "theirs"
+
+    def failing(owner):
+        raise RuntimeError("session gone")
+
+    monkeypatch.setattr(client, "cancel", failing)
+    result = agent.run(client, "x", provider=provider, say=lambda line: None)
+    assert "could not be stopped" in result.message and "session gone" in result.message
+    gate.touch()
+
+
+def test_reply_images_reads_only_files_in_the_run_image_dir_within_the_size_limit(tmp_path, monkeypatch):
+    from makermods_llm_harness import kernel
+    inside, outside = tmp_path / "images", tmp_path / "secret"
+    inside.mkdir()
+    outside.mkdir()
+    (inside / "grid-0001.jpg").write_bytes(b"\xff\xd8ok")
+    (outside / "grid-0002.jpg").write_bytes(b"\xff\xd8no")
+    (inside / "grid-0003.jpg").write_bytes(b"\xff\xd8" + b"x" * 100)
+    import hashlib
+    paths = [str(inside / "grid-0001.jpg"), str(outside / "grid-0002.jpg"), str(inside / "../secret/grid-0002.jpg")]
+    digests = {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths}
+    reply = {"image_dir": str(inside), "images": paths, "image_digests": digests}
+    assert kernel.reply_images(reply, 3) == [b"\xff\xd8ok"]
+    big = str(inside / "grid-0003.jpg")
+    monkeypatch.setattr(kernel, "MAX_IMAGE_BYTES", 50)
+    assert kernel.reply_images({"image_dir": str(inside), "images": [big],
+                                "image_digests": {big: hashlib.sha256(Path(big).read_bytes()).hexdigest()}}, 1) == []
+
+
+def test_a_motion_fault_in_python_ends_the_run_as_a_fault(served, monkeypatch):
+    server, client = served()
+    client.step({"action": "home"})
+    original = server.harness.confirm_hold
+    monkeypatch.setattr(server.harness, "confirm_hold", lambda names=None: "arm: the hold is not confirmed: test")
+    server.harness.backend.block("arm")
+    provider = Scripted(Reply(tool_calls=[ToolCall("py-1", "run_python",
+                                                   {"code": "r.move_joints({'wrist_roll': 20}, relative=True)"})]),
+                        Reply(tool_calls=[ToolCall("call-2", "gripper", {"opening": 1})]),
+                        Reply("Reported."))
+    result = agent.run(client, "turn", provider=provider, say=lambda line: None)
+    monkeypatch.setattr(server.harness, "confirm_hold", original)
+    assert result.status == "fault" and result.steps == 1
+    assert server.harness.state().arms["arm"].gripper < 0.05
+
+
+def test_a_fault_seen_only_in_the_final_poll_ends_the_run_as_a_fault(served):
+    server, client = served()
+    client.step({"action": "home"})
+    server.harness.backend.set_fault("arm", "motor 3 overcurrent")
+    provider = Scripted(Reply(tool_calls=[ToolCall("py-1", "run_python", {"code": "x = 1"})]),
+                        Reply("All done."), Reply("The arm reports a fault."))
+    result = agent.run(client, "nothing", provider=provider, say=lambda line: None)
+    server.harness.backend.set_fault("arm", None)
+    assert result.status == "fault"

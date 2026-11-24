@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 250" width="760" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>Pick up the cup and place it in the tray, real Metal arm: 279 s before, 87 s with the new harness</title>
+  <rect width="760" height="250" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="24" y="34" font-size="16" font-weight="600" fill="#1f2328">Pick up the cup, place it in the tray: 3.2× faster</text>
+  <text x="24" y="54" font-size="12" fill="#59636e">A coding agent drives a real Metal arm from camera images. Seconds from its first command to the arm at rest.</text>
+  <text x="24" y="98" font-size="13" fill="#1f2328">Before</text>
+  <text x="24" y="114" font-size="11" fill="#59636e">one action per model step</text>
+  <rect x="180" y="84" width="181" height="28" rx="4" fill="#2f6fed"/>
+  <rect x="363" y="84" width="317" height="28" rx="4" fill="#1aa89a"/>
+  <text x="690" y="103" font-size="13" font-weight="600" fill="#1f2328">279 s</text>
+  <text x="24" y="154" font-size="13" fill="#1f2328">Now</text>
+  <text x="24" y="170" font-size="11" fill="#59636e">queued programs</text>
+  <rect x="180" y="140" width="42" height="28" rx="4" fill="#2f6fed"/>
+  <rect x="224" y="140" width="112" height="28" rx="4" fill="#1aa89a"/>
+  <text x="346" y="159" font-size="13" font-weight="600" fill="#1f2328">87 s</text>
+  <line x1="180" y1="186" x2="680" y2="186" stroke="#d0d7de"/>
+  <g font-size="11" fill="#59636e" text-anchor="middle">
+    <text x="180" y="202">0</text><text x="359" y="202">100</text><text x="538" y="202">200 s</text>
+  </g>
+  <rect x="180" y="218" width="10" height="10" rx="3" fill="#2f6fed"/>
+  <text x="196" y="227" font-size="12" fill="#59636e">Arm moving (101 s → 23 s)</text>
+  <rect x="380" y="218" width="10" height="10" rx="3" fill="#1aa89a"/>
+  <text x="396" y="227" font-size="12" fill="#59636e">Arm waiting for the model (178 s → 64 s)</text>
+</svg>

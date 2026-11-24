@@ -18,7 +18,7 @@ import yaml
 
 from makermods_llm_harness import Harness, cli
 from makermods_llm_harness.cli import main
-from makermods_llm_harness.log import read_episode
+from makermods_llm_harness.log import latest_run, read_episode
 from makermods_llm_harness.robot import Robot
 from makermods_llm_harness.safety import load_calibration
 from makermods_llm_harness.session import Client, SessionError
@@ -168,7 +168,7 @@ def test_quit_rests_the_arms_and_ends_serve(serve, op, capsys, tmp_path):
     session["thread"].join(30)
     assert session["code"] == 0
     events = read_episode(tmp_path / "run")
-    assert events[-2]["action"] == {"action": "home"} and events[-1]["event"] == "end"
+    assert events[-3]["action"] == {"action": "home"} and [e["event"] for e in events[-2:]] == ["closing", "end"]
 
 
 class HighTable(SimBackend):
@@ -367,18 +367,19 @@ def test_log_show_and_resume(serve, op, capsys, tmp_path):
 # ── mcp / run ──
 def test_mcp_and_run_dispatch(serve, address, capsys, monkeypatch):
     seen = []
-    mcp = types.SimpleNamespace(run=lambda target: seen.append(target))
+    mcp = types.SimpleNamespace(run=lambda target, **options: seen.append(target))
     agent = types.SimpleNamespace(run=lambda target, task, **options: seen.append((target, task, options))
                                   or types.SimpleNamespace(status=options.get("model", "done"), steps=3, message="ok"))
     monkeypatch.setitem(sys.modules, "makermods_llm_harness.mcp_server", mcp)
     monkeypatch.setitem(sys.modules, "makermods_llm_harness.agent", agent)
 
     assert main(["mcp", "--sim"]) == 0
-    assert isinstance(seen[-1], Harness) and read_episode(seen[-1].log.run_dir)[-1]["event"] == "end"
+    assert isinstance(seen[-1], Client)                    # the robot is reached through a session of its own
+    assert read_episode(latest_run())[-1]["event"] == "end"
     assert main(["run", "pick up the cube", "--sim", "--arm", "maker", "--max-steps", "5", "--timeout", "9"]) == 0
-    harness, task, options = seen[-1]
-    assert task == "pick up the cube" and options == {"max_steps": 5, "timeout_s": 9.0}
-    assert {"event": "note", "text": "task: pick up the cube"}.items() <= read_episode(harness.log.run_dir)[1].items()
+    target, task, options = seen[-1]
+    assert isinstance(target, Client) and task == "pick up the cube" and options == {"max_steps": 5, "timeout_s": 9.0}
+    assert {"event": "note", "text": "task: pick up the cube"}.items() <= read_episode(latest_run())[1].items()
     assert "done after 3 steps: ok" in capsys.readouterr().out
     assert main(["run", "task", "--sim", "--model", "failed"]) == 1
 

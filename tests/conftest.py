@@ -4,6 +4,8 @@ kinematic simulator and closes them afterwards."""
 from __future__ import annotations
 
 import os
+import shutil
+import threading
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")   # small matrices: idle BLAS threads only take CPU from
 os.environ.setdefault("OMP_NUM_THREADS", "1")        # the control loops
@@ -57,3 +59,27 @@ GRASP_PITCH = {"metal": -90, "maker": -45}
 # reach 24 mm forward of its tool point).
 GRASP_X = {"metal": 0.28, "maker": 0.26}
 GRASP_Z = {"metal": 0.035, "maker": 0.035}
+
+
+@pytest.fixture
+def served(sim_harness, tmp_path):
+    """``start(harness=None, **sim_harness kwargs) -> (server, client)``: a session on a thread at a short private
+    address, with images under tmp_path; its kernel is ended and the server shut down afterwards."""
+    from makermods_llm_harness.session import Client, Server, private_address
+    started = []
+
+    def start(harness=None, **kwargs):
+        kwargs.setdefault("image_dir", tmp_path / "images")
+        server = Server(harness or sim_harness(**kwargs), private_address())
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        started.append((server, thread))
+        return server, Client(server.address, timeout_s=120)
+
+    yield start
+    for server, thread in started:
+        server.shutdown()
+        thread.join(30)
+        server.release()
+        if os.name != "nt":
+            shutil.rmtree(os.path.dirname(server.address), ignore_errors=True)

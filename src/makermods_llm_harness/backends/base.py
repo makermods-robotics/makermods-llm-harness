@@ -13,12 +13,13 @@ from __future__ import annotations
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
 import numpy as np
 
 ARM_TYPES = ("metal", "maker")
-OFF = ("released", "always_on")   # rest() outcomes after which nothing holds torque the harness owns
+OFF = ("released", "released_unrested", "always_on")   # outcomes after which nothing holds torque the harness owns
+# "released": off at its rest pose; "released_unrested": off where the operator supports it, not at rest.
 
 
 @dataclass(frozen=True)
@@ -72,7 +73,8 @@ class Frame:
 
 
 class Backend(ABC):
-    """A robot the harness can drive. Methods are called from one thread at a time."""
+    """A robot the harness can drive. Methods are never called at the same time, though they may be called from
+    different threads."""
 
     @property
     @abstractmethod
@@ -90,10 +92,11 @@ class Backend(ABC):
         the harness needs a table calibration before it moves an arm."""
         return None
 
-    def enable(self, arm: str, cancel: Optional[threading.Event] = None) -> None:
+    def enable(self, arm: str, cancel: Optional[threading.Event] = None, speed: Optional[float] = None) -> None:
         """Make the arm ready to follow targets, holding its current pose (real arms: torque on); a set
-        ``cancel`` aborts it. The harness calls it at the rest pose, before the first motion of an arm
-        whose state does not report ``enabled`` True."""
+        ``cancel`` aborts it, and ``speed`` (rad/s; given only when a motion asked for a lower speed) caps any
+        motion of its own. The harness calls it at the rest pose, before the first motion of an arm whose state
+        does not report ``enabled`` True."""
 
     @abstractmethod
     def read(self) -> dict[str, ArmState]:
@@ -105,10 +108,21 @@ class Backend(ABC):
         a simulator advances its clock, real hardware sleeps. The harness sends consecutive waypoints of a
         checked path, one per call, so an arm should reach each target within about ``dt``."""
 
-    def hold(self, arm: str) -> None:
-        """Freeze the arm at its measured joints and gripper opening, replacing every outstanding target."""
+    def feedback_ages(self, arm: str) -> Optional[Sequence[float]]:
+        """Seconds since each joint of the arm (the arm joints, then the gripper) last reported a sample, or None
+        when every ``read()`` returns fresh feedback. Before releasing an arm at rest the harness waits for every
+        joint to report a sample newer than its last rest waypoint."""
+        return None
+
+    hold_settle_s = 0.0      # seconds after ``hold`` before it shows in ``read()`` (control ticks under way)
+
+    def hold(self, arm: str) -> Optional[tuple[np.ndarray, float]]:
+        """Freeze the arm at its measured joints and gripper opening, replacing every outstanding target, before
+        returning; raise when that cannot be done. Returns the setpoint used, ``(q, opening)`` (None when not
+        known). The harness confirms it from a ``read()`` ``hold_settle_s`` later."""
         state = self.read()[arm]
         self.step({arm: ArmTarget(state.q, state.gripper)}, 0.0)
+        return state.q.copy(), float(state.gripper)
 
     def images(self) -> dict[str, Frame]:
         """The newest image of each camera. A camera without a recent image is left out."""

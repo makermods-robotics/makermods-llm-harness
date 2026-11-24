@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from makermods_llm_harness import tools
+from makermods_llm_harness.kernel import GUIDE, TOOL
 from makermods_llm_harness.mcp_server import build_server
 
 mcp = pytest.importorskip("mcp")
@@ -138,3 +139,25 @@ def test_a_cancelled_call_ends_its_motion(sim_harness):
     state = h.backend.read()["arm"]
     assert obs.arms["arm"].enabled and np.array_equal(state.q_target, state.q)    # held where it was
     assert not np.allclose(state.q, h.models["arm"].home_q, atol=0.05)              # short of home
+
+
+def test_run_python_runs_kernel_code_and_returns_reports_with_their_grid(served):
+    server, h = served()
+
+    async def body(client):
+        assert [t.name for t in (await client.list_tools()).tools] == [t["name"] for t in tools() + [TOOL]]
+        assert client.instructions.endswith(GUIDE)
+        first = await client.call_tool("run_python", {"code": "def home(r):\n    r.home()\nkernel.queue(home)"})
+        news = [first]
+        while not any("[action #1 home] done" in r.content[0].text for r in news):
+            news.append(await client.call_tool("run_python", {"code": "", "wait_s": 60}))
+        failed = await client.call_tool("run_python", {"code": "r.move([2, 0, 0])"})
+        return first, news, failed
+
+    first, news, failed = session(h, body)
+    assert not first.is_error and first.content[0].text.startswith("1\n")
+    reported = next(r for r in news if "[action #1 home] done" in r.content[0].text)
+    text, *images = reported.content
+    assert "[state] arm: tool [" in text.text
+    assert [b.type for b in images] == ["image"] and decode(images[0]).shape[0] == 240
+    assert failed.is_error and "MotionFailed: rejected" in failed.content[0].text

@@ -97,9 +97,9 @@ def test_plans_start_from_the_measured_joints_and_every_motion_target_carries_th
     sent, starts = [], []
     original = harness_module.Harness._checked_path
 
-    def recording(self, name, act, q0, *rest):
+    def recording(self, name, act, q0, *rest, **options):
         starts.append((q0.copy(), self.backend.read()[name].q.copy()))
-        return original(self, name, act, q0, *rest)
+        return original(self, name, act, q0, *rest, **options)
 
     monkeypatch.setattr(harness_module.Harness, "_checked_path", recording)
 
@@ -127,10 +127,14 @@ def test_plans_start_from_the_measured_joints_and_every_motion_target_carries_th
 
 # ── watching while moving ──
 def test_a_joint_off_its_path_holds_the_arm(sim_harness):
-    h = sim_harness()
+    h = sim_harness(backend=Offset(sim_backend().arms))
     assert_done(h.step({"action": "home"}))
     h.backend.block("arm")
     obs = h.step({"action": "move_joints", "joints_deg": {"wrist_roll": 30}, "relative": True})
+    assert obs.result.status == "stopped" and "blocked: wrist_roll" in obs.result.message
+    h.backend.block("arm", False)
+    h.backend.offset = math.radians(8)                       # 8 deg off its path at once
+    obs = h.step({"action": "move_joints", "joints_deg": {"wrist_roll": 5}, "relative": True})
     assert obs.result.status == "stopped" and "blocked: wrist_roll" in obs.result.message
     assert "tolerance 6 deg" in obs.result.message
 
@@ -194,16 +198,17 @@ def test_a_motion_that_does_not_arrive_holds_and_a_stop_while_settling_is_stoppe
     assert obs.result.status == "stopped" and "on request" in obs.result.message
 
 
-def test_a_tool_move_is_done_only_near_its_target_and_reports_how_far_off_it_ended(sim_harness):
+def test_a_tool_move_reports_how_far_off_its_target_it_ended(sim_harness):
     h = sim_harness(backend=type("Close", (Offset,), {"offset": math.radians(1.5)})(sim_backend().arms))
     assert_done(h.step({"action": "home"}))
     obs = h.step(move((0.31, 0, 0.54), -5))
     assert_done(obs)
     assert obs.result.error == {"position_m": 0.0, "angle_deg": 1.5}
     h = sim_harness(backend=type("Far", (Offset,), {"offset": math.radians(4)})(sim_backend().arms))
-    assert_done(h.step({"action": "home"}))
+    assert_done(h.step({"action": "home"}))                    # the 4 deg it stands off its command stays put
     obs = h.step(move((0.31, 0, 0.54), -5))
-    assert obs.result.status == "stopped" and obs.result.error["angle_deg"] == 4.0
+    assert_done(obs)
+    assert obs.result.error == {"position_m": 0.0, "angle_deg": 4.0}
     assert "ended 0 mm and 4.0 deg from the target" in obs.result.message
 
 

@@ -15,7 +15,9 @@ from __future__ import annotations
 import importlib
 import math
 import os
+import queue
 import sys
+import threading
 import warnings
 import xml.etree.ElementTree as ET
 from typing import Mapping, Optional, Sequence
@@ -175,6 +177,7 @@ class MujocoBackend(Backend):
             if self._mj.mj_name2id(self.model, self._mj.mjtObj.mjOBJ_CAMERA, name) < 0:
                 raise ValueError(f"no camera {name!r}; cameras: top, " + ", ".join(f"{n}_wrist" for n in self._arms))
         self._renderer = None
+        self._render_jobs: Optional[queue.Queue] = None     # work for the thread that owns the GL context
         self.render_error: Optional[str] = None
         for arm in self._arms.values():
             p, names = arm.info.name + "/", arm.chain.joint_names
@@ -269,23 +272,44 @@ class MujocoBackend(Backend):
         return "always_on"
 
     def images(self) -> dict[str, Frame]:
-        if self._renderer is None and self.render_error is None:
+        """Rendered on one thread of the backend's own, which owns the GL context (an EGL context belongs to the
+        thread that made it current), whichever thread asks."""
+        if self.render_error is not None:
+            return {}
+        if self._render_jobs is None:
+            self._render_jobs = queue.Queue()
+            threading.Thread(target=self._render_loop, args=(self._render_jobs,), name="mujoco-render",
+                             daemon=True).start()
+        done: queue.Queue = queue.Queue()
+        self._render_jobs.put(done)
+        frames = done.get()
+        if self.render_error is not None and not frames:
+            warnings.warn(self.render_error, RuntimeWarning, stacklevel=2)
+        return frames
+
+    def _render_loop(self, jobs: queue.Queue) -> None:
+        while True:
+            done = jobs.get()
+            if done is None:
+                if self._renderer is not None:
+                    self._renderer.close()
+                    self._renderer = None
+                return
+            frames = {}
             try:
-                self._renderer = self._mj.Renderer(self.model, self.size[1], self.size[0])
+                if self._renderer is None:
+                    self._renderer = self._mj.Renderer(self.model, self.size[1], self.size[0])
+                for name in self._cameras:
+                    self._renderer.update_scene(self.data, camera=name)
+                    frames[name] = Frame(self._renderer.render().copy(), float(self.data.time))
             except Exception as e:
                 self.render_error = (f"MuJoCo cannot render offscreen (MUJOCO_GL={os.environ.get('MUJOCO_GL', '')!r}):"
                                      f" {e}. Import this module before mujoco, or set MUJOCO_GL to egl or osmesa"
                                      f" (with that library installed) before mujoco is first imported.")
-                warnings.warn(self.render_error, RuntimeWarning, stacklevel=2)
-        if self._renderer is None:
-            return {}
-        frames = {}
-        for name in self._cameras:
-            self._renderer.update_scene(self.data, camera=name)
-            frames[name] = Frame(self._renderer.render().copy(), float(self.data.time))
-        return frames
+                frames = {}
+            done.put(frames)
 
     def close(self) -> None:
-        if self._renderer is not None:
-            self._renderer.close()
-            self._renderer = None
+        if self._render_jobs is not None:
+            self._render_jobs.put(None)
+            self._render_jobs = None

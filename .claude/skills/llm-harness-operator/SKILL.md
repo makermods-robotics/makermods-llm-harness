@@ -35,7 +35,15 @@ expect to see before each motion and check it after.
 | `llm-harness rest` | every arm back to rest, motors off: how every task ends |
 
 With two arms add `--arm left` or `--arm right` to every motion. `llm-harness ops "A" "B"` runs several ops and
-stops at the first one not done; never chain `op` calls with `;`.
+stops at the first one not done; never chain `op` calls with `;`. `--dry-run` checks a motion without moving it;
+`--until contact` on `move_tool` or `nudge` stops where the arm meets something.
+
+## Faster: the Python kernel
+
+`llm-harness py` runs code in the session's persistent kernel: check a whole plan with `r.reachable(...)` in one call,
+queue motions as actions with `kernel.queue(fn)`, and write the next action while the arm runs the current one;
+`llm-harness py --wait 30` picks up the next report. [docs/AGENT_GUIDE.md](../../../docs/AGENT_GUIDE.md) is the guide;
+read it once before using the kernel.
 
 ## Results
 

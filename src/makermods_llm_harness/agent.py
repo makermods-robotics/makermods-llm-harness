@@ -5,10 +5,14 @@
         result = agent.run(h, "pick up the red cube and lift it 10 cm")
 
 ``target`` is a ``Harness`` or a session ``Client`` (anything with ``observe``, ``step`` and ``describe``).
+With a session Client, the model also gets the ``run_python`` tool (``kernel.TOOL``) on the session's Python kernel
+and the kernel guide in its prompt. When the model ends its turn while queued actions run or reports wait, the loop
+waits for the next report and hands it to the model.
 
 The loop talks to a provider: any object with ``complete(system, messages, tools) -> Reply``.
 
-- ``system`` is the prompt text and ``tools`` is ``actions.tools()`` (name, description, input_schema).
+- ``system`` is the prompt text and ``tools`` is ``actions.tools()`` (name, description, input_schema), plus
+  ``run_python``.
 - ``messages`` alternate between ``{"role": "user", "content": [part, ...]}``, with parts
   ``{"type": "text", "text"}``, ``{"type": "image", "camera", "jpeg": bytes}`` and
   ``{"type": "tool_result", "id", "content": [text and image parts]}``, and
@@ -29,16 +33,18 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .actions import Observation, tools
+from .kernel import GUIDE, TOOL, format_reply, kernel_for, reply_images
 
 DEFAULT_MODEL = "claude-opus-5-5"
 KEEP_IMAGES = 3          # the most recent observations whose images stay in the conversation
 MAX_TOKENS = 16000
 GRACE_S = 10.0           # how long an ended action may take to hold before the loop gives up on it
+REPORT_WAIT_S = 60.0     # longest wait for a report when the model ends its turn while actions run
 
 ROLE = ("You control a robot through tools. Each tool call runs one action and returns the robot's state as text "
         "and a fresh image from every camera.")
 RULES = """How to work:
-- Look before you move and after every move: check the images and the reported tool position.
+- Look before you move and check the outcome of every move: the reported state and the camera images.
 - Near the table and near objects, move in small steps and check the clearance each time.
 - "rejected" means nothing moved: read the message, change the request and try again.
 - "stopped" means the action ended early: look before going on.
@@ -86,6 +92,24 @@ def _drop_old_images(holders: list[list[dict]]) -> None:
                 parts[i] = {"type": "text", "text": f"(older {part['camera']} image left out)"}
 
 
+def _reply_parts(reply: dict) -> list[dict]:
+    """A kernel reply as message parts: its text, then the newest camera grid it names (``reply_images``)."""
+    parts = [{"type": "text", "text": format_reply(reply)}]
+    parts += [{"type": "image", "camera": "grid", "jpeg": jpeg} for jpeg in reply_images(reply, 1)]
+    return parts
+
+
+def _fault_in(reply: dict) -> Optional[str]:
+    """What faulted, when a kernel reply says something did: an arm, the call's own motion, or a queued action."""
+    if reply.get("faults"):
+        return "; ".join(f"{n}: {t}" for n, t in reply["faults"].items())
+    if reply.get("motion") == "fault":
+        return "a motion of the code ended in a fault"
+    if any(r.get("message", "").startswith("fault") for r in reply.get("reports", [])):
+        return "a queued action ended in a fault"
+    return None
+
+
 def _line(call: ToolCall, obs: Observation) -> str:
     line = f"{call.name} {json.dumps(call.input)} -> {obs.result.status}"
     return f"{line}: {obs.result.message[:100]}" if obs.result.message else line
@@ -116,17 +140,39 @@ def _in_thread(fn, cancel: threading.Event, deadline: float, ended: Optional[thr
 
 
 def run(target, task: str, *, model: str = DEFAULT_MODEL, max_steps: int = 40, timeout_s: float = 600.0,
-        provider=None, say: Callable[[str], None] = print, cancel: Optional[threading.Event] = None) -> RunResult:
-    """Let the model work on ``task`` until it answers without a tool call, ``max_steps`` actions have run,
-    ``timeout_s`` has passed, ``cancel`` is set, or an action ends in a fault (the model then reports, without
-    more actions). The model's replies and the actions are waited for no longer than the time left; an action
-    still running then is ended (the arm holds). After an action that stops early, the rest of that reply's
-    tool calls are not run."""
+        provider=None, say: Callable[[str], None] = print, cancel: Optional[threading.Event] = None,
+        python: bool = True) -> RunResult:
+    """Let the model work on ``task`` until it answers without a tool call (with no queued action running and no
+    report waiting), ``max_steps`` tool calls have run, ``timeout_s`` has passed, ``cancel`` is set, or an action
+    ends in a fault (the model then reports, without more actions). The model's replies and the actions are waited
+    for no longer than the time left; an action still running then is ended (the arm holds), and the kernel's
+    queue is stopped. After an action that stops early, the rest of that reply's tool calls are not run.
+    ``python`` offers the run_python tool when the target has a kernel."""
     provider = provider or AnthropicProvider(model)
     cancel = cancel or threading.Event()
     deadline = time.monotonic() + timeout_s
-    system = f"{ROLE}\n\n{target.describe()}\n\n{RULES}"
-    defs = tools()
+    kernel = kernel_for(target) if python else None
+    result = None
+    try:
+        result = _loop(target, task, provider, say, cancel, deadline, timeout_s, max_steps, kernel)
+    finally:
+        if kernel is not None and (result is None or result.status != "done"):
+            # Nothing this run queued goes on after it ends any other way.
+            try:
+                stopped = kernel.cancel()
+                if stopped:
+                    say("stopped what the run had queued: " + ", ".join(stopped))
+            except Exception as e:
+                problem = f"the work this run queued could not be stopped ({type(e).__name__}: {e})"
+                say(problem)
+                if result is not None:
+                    result.message = f"{result.message} ({problem})"
+    return result
+
+
+def _loop(target, task, provider, say, cancel, deadline, timeout_s, max_steps, kernel) -> RunResult:
+    system = f"{ROLE}\n\n{target.describe()}\n\n{RULES}" + (f"\n\n{GUIDE}" if kernel is not None else "")
+    defs = tools() + ([TOOL] if kernel is not None else [])
     obs = target.observe()
     first = _parts(obs, f"Task: {task}\n\nThe robot now:\n{obs.text()}")
     messages: list[dict] = [{"role": "user", "content": first}]
@@ -152,6 +198,25 @@ def run(target, task: str, *, model: str = DEFAULT_MODEL, max_steps: int = 40, t
         if fault is not None:
             return RunResult("fault", steps, reply.text or fault)
         if not reply.tool_calls:
+            if kernel is not None:
+                wait_s = min(REPORT_WAIT_S, max(0.0, deadline - time.monotonic()))
+                done, news = _in_thread(lambda: kernel.execute("", wait_s), cancel, deadline)
+                if not done:
+                    return ended()
+                problem = _fault_in(news)
+                if problem and fault is None:          # a fault the final poll shows: the model reports it first
+                    fault = problem
+                    parts = _reply_parts(news) + [{"type": "text", "text": FAULT_NOTE}]
+                    holders.append(parts)
+                    _drop_old_images(holders)
+                    messages.append({"role": "user", "content": parts})
+                    continue
+                if news["reports"] or news["busy"]:
+                    parts = _reply_parts(news)
+                    holders.append(parts)
+                    _drop_old_images(holders)
+                    messages.append({"role": "user", "content": parts})
+                    continue
             return RunResult("done", steps, reply.text)
         results: list[dict] = []
         skip = None
@@ -164,6 +229,28 @@ def run(target, task: str, *, model: str = DEFAULT_MODEL, max_steps: int = 40, t
                 results.append({"type": "tool_result", "id": call.id, "content": [{"type": "text", "text": skip}]})
                 continue
             stop = threading.Event()
+            if kernel is not None and call.name == TOOL["name"]:
+                code, wait_s = call.input.get("code", ""), call.input.get("wait_s")
+                done, news = _in_thread(lambda: kernel.execute(code, wait_s, cancel=stop), cancel, deadline, ended=stop)
+                if not done:
+                    return ended() or RunResult("stopped", steps, "the kernel call did not end")
+                steps += 1
+                say(f"[{steps}] run_python -> {'error' if news['error'] else 'ok'}"
+                    + "".join(f"; #{r['id']} {r['name']} {r['status']}" for r in news["reports"]))
+                parts = _reply_parts(news)
+                results.append({"type": "tool_result", "id": call.id, "content": parts})
+                holders.append(parts)
+                problem = _fault_in(news)
+                if problem:
+                    fault = fault or problem
+                    skip = "not run: the arm reported a fault"
+                elif news.get("stopped") or news.get("motion") not in (None, "done") or \
+                        any(r["status"] != "done" for r in news["reports"]):
+                    if ended():
+                        return ended()
+                    skip = "not run: the code or a queued action before it stopped early; look before going on"
+                continue
+
             done, obs = _in_thread(lambda: target.step({**call.input, "action": call.name}, cancel=stop),
                                    cancel, deadline, ended=stop)
             if not done:

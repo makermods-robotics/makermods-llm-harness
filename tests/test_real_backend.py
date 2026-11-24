@@ -90,7 +90,7 @@ def test_targets_move_the_arm_and_read_follows(rig):
 
     assert wait_for(arrived)
     state = backend.read()["arm"]
-    assert np.allclose(state.q_target, goal, atol=1e-6) and state.gripper_target == 0.5
+    assert np.allclose(state.q_target, goal, atol=1e-6) and abs(state.gripper_target - 0.5) < 0.03
     assert np.allclose(sim.positions[:6], goal, atol=1e-3)
     assert state.fault is None
 
@@ -100,6 +100,12 @@ def test_refused_target_is_reported(rig):
     q = backend.read()["arm"].q
     backend.step({"arm": ArmTarget(q, 0.0)}, 0.0)
     assert backend.read()["arm"].fault == "targets refused: arm is CONNECTED"
+    assert backend.read()["arm"].fault == "targets refused: arm is CONNECTED"     # a read does not consume it
+    with pytest.raises(RuntimeError, match="refused the hold"):
+        backend.hold("arm")
+    backend.enable("arm")
+    assert backend.read()["arm"].fault is None
+    backend.step({"arm": ArmTarget(q, 0.0)}, 0.0)
     assert backend.read()["arm"].fault is None
 
 
@@ -434,7 +440,8 @@ def test_an_exit_that_cannot_rest_asks_the_operator_and_names_the_rest_command(r
     lines = []
     assert report_outcomes(outcomes, lines.append, backend.recovery) == (0 if release else 1)
     if release:
-        assert outcomes == {"arm": "released"} and not any(sim.motor(j).enabled for j in range(6))
+        assert outcomes == {"arm": "released_unrested"} and not any(sim.motor(j).enabled for j in range(6))
+        assert "NOT at its rest pose" in lines[0]
     else:
         assert outcomes["arm"].startswith("detached") and all(sim.motor(j).enabled for j in range(6))
         assert command in lines[0] and "release" in lines[0]
@@ -473,3 +480,13 @@ def test_an_arm_left_energized_is_attached_and_rested(kind):
     assert obs.result.ok, obs.result.message
     assert np.degrees(np.abs(np.array(sim.positions[:6]) - rest)).max() < 2.0
     assert h.close() == {"arm": "released"}
+
+
+def test_a_hold_returns_the_sdk_setpoint_and_waits_two_control_periods(rig):
+    backend, sim, _ = rig
+    backend.enable("arm")
+    q, opening = backend.hold("arm")
+    commanded = backend.group["arm"].get_commanded_positions()
+    assert np.allclose(q, commanded[:6]) and -0.01 <= opening <= 1.01      # the measured opening, unclipped
+    rate = backend.group["arm"].config.control_rate_hz
+    assert backend.hold_settle_s == pytest.approx(2.0 / rate)

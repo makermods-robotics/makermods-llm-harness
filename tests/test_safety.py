@@ -144,7 +144,7 @@ def test_hard_floor_rejects_a_path_that_goes_under_the_margin():
     env = envelope(clearance_at_home=0.10)
     path = tool_path(HOME, -0.095, CFG.slow_speed_deg_s)
     with pytest.raises(MoveRejected, match=r"the gripper fingertips to 5 mm above the table \(-\d+ mm allowing for "
-                                           r"tracking error and sag\), under the 10 mm hard floor\. Aim"):
+                                           r"tracking error and sag\), under the 10 mm hard floor\. From here the lowest point may come down at most \d+ mm"):
         env.check(HOME, path)
     env.check(HOME, tool_path(HOME, -0.09 + ALLOW, CFG.slow_speed_deg_s))
 

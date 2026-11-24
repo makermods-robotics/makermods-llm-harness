@@ -3,3 +3,6 @@ Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Motion planning uses the trajectory inverse kinematics of the metal-arm and maker-arm SDKs (Apache License,
 Version 2.0), a numpy port of the algorithm in Dream Labs' dream_ik; see the SDKs' NOTICE files.
+
+The kernel, the action queue and the batch reach check follow the design of making-rua-fast
+(https://github.com/fast-rua/making-rua-fast, Apache License, Version 2.0). No code from it is included.

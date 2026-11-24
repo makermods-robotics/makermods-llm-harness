@@ -57,7 +57,7 @@ class RealBackend(Backend):
         self._camera_names = list(cameras)
         self._cameras: dict[str, object] = {}
         self._opening: dict[str, float] = {}       # last commanded gripper opening since enable
-        self._refused: dict[str, str] = {}         # a refused target, reported by the next read()
+        self._refused: dict[str, str] = {}         # a refused target, reported until a hold or an accepted target
         self._off: dict[str, tuple[float, Optional[bool], list[str]]] = {}   # arm off: (read at, torque, stale)
         self._released: set[str] = set()           # torque off confirmed by this session's own release
         self.closed_as: dict[str, str] = {}        # per arm after close()
@@ -112,10 +112,10 @@ class RealBackend(Backend):
     def cameras(self) -> list[str]:
         return list(self._camera_names)
 
-    def enable(self, arm: str, cancel: Optional[threading.Event] = None) -> None:
+    def enable(self, arm: str, cancel: Optional[threading.Event] = None, speed: Optional[float] = None) -> None:
         a = self.group[arm]
         if a.state.name != "ENABLED":
-            a.enable(cancel=cancel, speed=ENABLE_SPEED)
+            a.enable(cancel=cancel, speed=ENABLE_SPEED if speed is None else min(ENABLE_SPEED, speed))
         if arm in self.rest_q:
             a.rest_pose = list(self.rest_q[arm]) + list((a.rest_pose or a.get_joint_positions())[6:])   # the SDK's own return goes there too
         self._released.discard(arm)
@@ -135,7 +135,8 @@ class RealBackend(Backend):
         positions = arm.get_joint_positions()
         q, gripper = np.array(positions[:6], float), float(arm.gripper_opening())
         holding = state in ("ENABLED", "FAULT")
-        q_target = np.array(arm.get_commanded_positions()[:6], float) if holding else q.copy()
+        commanded = arm.get_commanded_positions() if holding else None
+        q_target = np.array(commanded[:6], float) if holding else q.copy()
         temps = [t for t in arm.get_temperatures() if math.isfinite(t)]
         no_feedback = [label for label, p in zip(arm.joint_names, positions) if not math.isfinite(p)]
         fault = (arm.fault_reason or (f"arm is in {state}" if state == "FAULT" else None)
@@ -145,12 +146,19 @@ class RealBackend(Backend):
                  or ("its motors report torque on, but not from this session (left on by another program): "
                      "restart the session with `llm-harness serve --attach` to take it over and rest it. "
                      + self.recovery(name) if state == "CONNECTED" and torque else None)
-                 or self._refused.pop(name, None))
+                 or self._refused.get(name))
         rest = self.rest_q.get(name)
         return ArmState(q=q, gripper=gripper, q_target=q_target,
-                        gripper_target=self._opening.get(name, gripper) if holding else gripper,
+                        gripper_target=self._commanded_opening(arm, commanded[6]) if holding else gripper,
                         enabled=torque, fault=fault, temperature=max(temps) if temps else None,
                         rest_q=None if rest is None else rest.copy())
+
+    @staticmethod
+    def _commanded_opening(arm, position: float) -> float:
+        """The opening (0 closed .. 1 open) the SDK's commanded gripper position stands for, by the SDK's own
+        linear mapping (``gripper_target``)."""
+        closed, wide = arm.gripper_target(0.0), arm.gripper_target(1.0)
+        return float((position - closed) / (wide - closed)) if wide != closed else 0.0
 
     def _torque_off(self, name: str, arm) -> tuple[Optional[bool], list[str]]:
         """(torque on: True / False / None when not known, joints without fresh feedback) of an arm that is
@@ -174,14 +182,32 @@ class RealBackend(Backend):
             command = np.asarray(target.q, float).tolist() + [arm.gripper_target(target.gripper)]
             if arm.move_to(command, speed=target.speed, wait=False):
                 self._opening[name] = min(1.0, max(0.0, float(target.gripper)))
+                self._refused.pop(name, None)
             else:
                 self._refused[name] = f"targets refused: arm is {arm.state.name}"
         self._sleep(dt)
 
-    def hold(self, arm: str) -> None:
+    def feedback_ages(self, arm: str) -> list[float]:
+        """Per joint, from the SDK's public status: seconds since its last feedback (inf when it has none)."""
+        joints = self.group[arm].status()["joints"].values()
+        return [math.inf if j.get("feedback_age") is None else float(j["feedback_age"]) for j in joints]
+
+    @property
+    def hold_settle_s(self) -> float:
+        """Two control periods of the slowest arm: the SDK's public API shows no tick counter, so a hold counts
+        as sent once two periods have passed."""
+        return 2.0 / min(float(a.config.control_rate_hz) for _, a in self.group)
+
+    def hold(self, arm: str) -> tuple[np.ndarray, float]:
+        """Freeze the arm at its measured pose; RuntimeError when the SDK refuses (the arm is not on). Returns the
+        setpoint the SDK took (its commanded positions right after)."""
         a = self.group[arm]
-        a.hold_current_position()
+        if not a.hold_current_position():
+            raise RuntimeError(f"{arm}: the SDK refused the hold (arm is {a.state.name})")
+        commanded = a.get_commanded_positions()
         self._opening[arm] = min(1.0, max(0.0, float(a.gripper_opening())))
+        self._refused.pop(arm, None)
+        return np.array(commanded[:6], float), self._commanded_opening(a, commanded[6])
 
     def _sleep(self, dt: float) -> None:
         """Sleep until one period after the previous deadline; restart the schedule when more than a period late."""
@@ -243,7 +269,7 @@ class RealBackend(Backend):
                 continue
             if release:
                 arm.disconnect()
-                self.closed_as[name] = "unknown" if arm.unconfirmed_disable else "released"
+                self.closed_as[name] = "unknown" if arm.unconfirmed_disable else "released_unrested"
                 continue
             try:
                 arm.hold_current_position()

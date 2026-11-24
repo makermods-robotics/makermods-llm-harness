@@ -370,7 +370,7 @@ def test_steps_go_to_the_episode_log(sim_harness, tmp_path):
     h.step({"action": "fly"})
     h.close()
     events = read_episode(tmp_path / "run")
-    assert [e["event"] for e in events] == ["start", "action", "step", "step", "end"]
+    assert [e["event"] for e in events] == ["start", "action", "step", "step", "closing", "end"]
     assert events[0]["table_z"] == {"arm": 0.0} and events[0]["safety"]["max_speed_deg_s"] == 20
     assert events[1] == {**events[1], "step": 1, "action": {"action": "home"}}      # written before the motion
     assert events[2]["action"] == {"action": "home"} and events[3]["observation"]["result"]["status"] == "rejected"
@@ -607,3 +607,17 @@ def test_close_skips_arms_that_are_off(sim_harness):
     assert_done(h.step({"action": "home", "arm": "right"}))
     assert h.close() == {"left": "released", "right": "released"}
     assert not any(s.enabled for s in h.backend.read().values())
+
+
+def test_a_second_straight_down_move_is_reachable_from_a_straight_down_pose(sim_harness):
+    h = sim_harness()
+    assert_done(h.step({"action": "home"}))
+    for xyz, pitch in APPROACH["metal"][:-1]:
+        assert_done(h.step(move(xyz, pitch)))
+    for xyz in ((0.28, 0.0, 0.21), (0.28, 0.05, 0.21), (0.30, 0.05, 0.18), (0.28, 0.0, 0.21)):
+        assert_done(h.step(move(xyz, -90)))
+    # A reading the real Metal arm gave after a straight-down move: pitch -89 with yaw -160 and roll 169.
+    obs = h.step(move((0.28, 0.0, 0.21), -89, yaw_deg=-160, roll_deg=169))
+    assert_done(obs)
+    assert (obs.arms["arm"].tool.yaw_deg, obs.arms["arm"].tool.roll_deg) == (-160.0, 169.0)
+    assert_done(h.step(move((0.28, 0.02, 0.20), -90)))

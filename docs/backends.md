@@ -48,10 +48,27 @@ time (`None`: made when `images()` was called). The harness encodes each frame t
   above the floor even with every joint `floor_tolerance_deg` off and `sag_allowance_m` lower, and no joint step
   larger than the speed limit allows in one tick. Each target carries that speed limit.
 - One `step(targets, dt)` per waypoint with `dt = 1 / rate_hz` (25 Hz by default), for one arm at a time, with a
-  `read()` after each: a fault on any arm, a hot motor, a joint more than `tracking_tolerance_deg` from the recent
-  waypoints, or a measured clearance more than `contact_allowance_m` under the floor ends the motion with `hold(arm)`.
-- After the last waypoint, the goal again for up to 1 s until the measured joints are within 1 deg of it; still
-  more than `tracking_tolerance_deg` away, the arm holds and the action is `stopped`.
+  `read()` after each: a fault on any arm, a hot motor, a joint more than `tracking_tolerance_deg` from every
+  waypoint sent within the last `tracking_lag_s`, or a measured clearance more than `contact_allowance_m` under the
+  floor ends the motion with `hold(arm)`. A move with `until: "contact"` also ends with `hold(arm)` once the arm has
+  followed its command and then its tool point stood still for 0.3 s while the command moved on, `contact_tolerance_m`
+  from every tool point sent within the lag. Elapsed time counts each tick from the end of the one before, and at
+  least `dt`. Each target goes out only after a stop check made under the lock that serializes backend calls.
+- `hold(arm)` must replace the arm's joint and gripper targets with its measured pose before it returns, or raise,
+  and returns the setpoint it used, `(q, opening)`. The harness reads every arm `hold_settle_s` later (0 by default;
+  two control periods on real arms): a fault, missing feedback, unknown torque, a joint sample older than
+  0.25 s (`feedback_ages`), or a commanded target (`q_target`, `gripper_target`: what the motors are commanded,
+  not a local copy) more than 0.2 deg (0.01 opening) from that setpoint, a setpoint away from where the arm was
+  measured, or a joint measured past its range makes the outcome a `fault`. Every stop, and every motion that ends other than by arriving, holds every
+  arm that reports `enabled` this way.
+- `feedback_ages(arm)` (optional): seconds since each joint, gripper last, reported a sample. The harness releases
+  an arm at rest only after every joint has reported one newer than the last rest waypoint (up to 1 s); the default
+  `None` says every `read()` is fresh. The real backend takes it from the SDK's `status()`.
+- `enable(arm, cancel, speed)`: `speed` (rad/s) is passed only when the motion asked for a lower speed; it caps any
+  motion of the backend's own while enabling.
+- After the last waypoint, the goal again for up to `settle_s` (1 s) until the measured joints are within 1 deg of
+  it; a joint still further than 2 deg, or a quarter of its travel (at most `tracking_tolerance_deg`), away holds
+  the arm and the action is `stopped`.
 - Turning an arm on: at its rest pose only, `enable(arm, cancel)`; a joint that rests past a limit is then brought
   inside it along a checked path at the slow speed.
 - For `rest`: a checked joint path straight to `rest_q` (clipped into the limits), or, when the envelope refuses
@@ -62,11 +79,15 @@ time (`None`: made when `images()` was called). The harness encodes each frame t
 - For the gripper action: the arm's `q_target` unchanged (`speed` `None`) and the requested opening, tick by tick
   for up to 2 s, until the measured opening reaches the request or stops changing.
 - For `wait`: `step({}, dt)` with no targets, so time passes.
-- After an action, `images()` until every frame was captured after the action ended, for up to 0.5 s; an older frame
-  is marked `stale` in the observation.
+- After an action (unless it was sent without images, as the kernel's motions are), `images()` until every frame was
+  captured after the action ended, for up to 0.5 s; an older frame is marked `stale` in the observation. `look()`
+  does the same for one camera grid.
 
-All calls come from one thread at a time: the harness serialises `step` and `observe`, and `Harness.stop()` (or a
-request's own cancel event) only sets a flag that the motion loop checks between waypoints.
+Calls may come from different threads but never at the same time: the harness runs every backend call under one
+lock, so `read()` and `images()` for `state()`, `look()` and reach checks fall between the ticks of a motion. A
+backend whose rendering belongs to one thread (an EGL context) renders on a thread of its own, as the MuJoCo backend
+does.
+`Harness.stop()` (or a request's own cancel event) only sets a flag that the motion loop checks between waypoints.
 
 Call order over a session: `arms`, `table_z` and `cameras` when the harness opens; then per action `read()`, maybe
 `enable(arm)`, the `step` calls with `read()` in between; `rest(arm)` at the end of a `rest` action.

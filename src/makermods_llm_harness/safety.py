@@ -76,6 +76,17 @@ def signed_distance(points: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.nd
     return np.where(inside > 0, np.linalg.norm(np.maximum(d, 0.0), axis=-1), inside)
 
 
+# Accepted range of every setting (inclusive). Settings outside ZERO_OK must also be above 0.
+LIMITS: dict[str, tuple[float, float]] = {
+    "max_speed_deg_s": (0.5, 180.0), "slow_speed_deg_s": (0.5, 180.0), "slow_zone_m": (0.0, 0.5),
+    "floor_margin_m": (0.0, 0.2), "max_excursion_deg": (1.0, 360.0), "max_temp_c": (20.0, 100.0),
+    "tracking_tolerance_deg": (0.5, 30.0), "tracking_lag_s": (0.0, 0.5), "settle_s": (0.0, 5.0),
+    "contact_tolerance_m": (0.001, 0.05), "floor_tolerance_deg": (0.0, 10.0), "sag_allowance_m": (0.0, 0.05),
+    "contact_allowance_m": (0.0, 0.05), "rate_hz": (5.0, 200.0), "keep_out_margin_m": (0.0, 0.2),
+    "finger_length_m": (0.0, 0.3), "jaw_half_width_m": (0.0, 0.3), "finger_margin_m": (0.0, 0.05),
+}
+
+
 class MoveRejected(Exception):
     """The motion breaks a rule of the envelope. The message says what to do instead."""
 
@@ -88,13 +99,21 @@ class CalibrationError(RuntimeError):
 class SafetyConfig:
     max_speed_deg_s: float = 20.0      # joint speed limit
     slow_speed_deg_s: float = 5.0      # joint speed limit within slow_zone_m of the table
-    slow_zone_m: float = 0.0762
+    slow_zone_m: float = 0.0762        # height above the table under which the slow speed applies
     floor_margin_m: float = 0.0        # hard floor: least planned clearance above the table (0: may touch it)
     max_excursion_deg: float = 35.0    # farthest any joint may travel from its start in one action
     max_temp_c: float = 70.0           # no motion while a motor is hotter
     # Farthest a measured joint may be from the planned path before the motion is held as blocked (the real
     # Metal arm tracks within about 3 deg at 15 deg/s).
     tracking_tolerance_deg: float = 6.0
+    # How long a measured joint may trail its command: it is compared with every waypoint sent within this much
+    # elapsed time, so the allowance along the path grows with the commanded speed (speed x lag) and the tolerance
+    # above applies across it. At most 0.5 s.
+    tracking_lag_s: float = 0.2
+    settle_s: float = 1.0              # longest wait after the last waypoint for the joints to reach the goal
+    # A move with until "contact" ends once the measured tool point is this far from every tool point commanded
+    # within the tracking lag.
+    contact_tolerance_m: float = 0.010
     # Per-joint error the planned-path floor check allows for (every joint this far off, summed as a worst case).
     floor_tolerance_deg: float = 0.0
     # Height the arm may sit below its kinematic model under its own weight (link and gear compliance).
@@ -110,7 +129,7 @@ class SafetyConfig:
     finger_margin_m: Optional[float] = None
     OPTIONAL: ClassVar[tuple[str, ...]] = ("finger_length_m", "jaw_half_width_m", "finger_margin_m")
     ZERO_OK: ClassVar[tuple[str, ...]] = ("floor_margin_m", "floor_tolerance_deg", "sag_allowance_m",
-                                          "contact_allowance_m", "keep_out_margin_m")
+                                          "contact_allowance_m", "keep_out_margin_m", "tracking_lag_s", "settle_s")
 
     def __post_init__(self):
         for f in fields(self):
@@ -121,6 +140,9 @@ class SafetyConfig:
                 raise ValueError(f"{f.name} must be a finite number, got {value!r}")
             if value < 0 or (value == 0 and f.name not in self.ZERO_OK + self.OPTIONAL):
                 raise ValueError(f"{f.name} must be > 0, got {value}")
+            lo, hi = LIMITS[f.name]
+            if not lo <= value <= hi:
+                raise ValueError(f"{f.name} must be between {lo:g} and {hi:g}, got {value:g}")
         if self.slow_speed_deg_s > self.max_speed_deg_s:
             raise ValueError("slow_speed_deg_s must not exceed max_speed_deg_s")
 
@@ -249,8 +271,8 @@ class Envelope:
             j = int(np.argmax(span))
             if span[j] > math.radians(cfg.max_excursion_deg) + 1e-9:
                 raise MoveRejected(f"{name}: {joints[j]} would move {math.degrees(span[j]):.0f} deg in one action, "
-                                   f"over the {cfg.max_excursion_deg:.0f} deg per-action limit. Split the motion "
-                                   "into smaller steps and look at the cameras in between.")
+                                   f"over the {cfg.max_excursion_deg:g} deg per-action limit (safety setting "
+                                   "max_excursion_deg). Split the motion into smaller steps.")
         try:
             self._check_floor(q_start, path)
         except MoveRejected:
@@ -264,6 +286,8 @@ class Envelope:
             zone = " near the table" if speed == self.slow_speed else ""
             raise MoveRejected(f"{name}: the motion moves {joints[j]} at {math.degrees(steps[j]) * cfg.rate_hz:.1f} "
                                f"deg/s, over the {math.degrees(speed):.0f} deg/s limit{zone}.")
+
+
 
     def rest_floor(self, rest_q) -> float:
         """The measured clearance under which a motion ending at the rest pose is held: the hard floor, or the
@@ -344,9 +368,11 @@ class Envelope:
         if guarded[0] >= floor:
             t = int(np.argmin(guarded[1:])) + 1
             if guarded[t] < floor:
+                room = (guarded[0] - floor) * 1000
                 refuse(t, f"{name}: that motion would bring the {{what}} to {{mm:.0f}} mm above the table "
                           "({guarded:.0f} mm allowing for tracking error and sag), under the {floor:.0f} mm hard "
-                          "floor. Aim higher.")
+                          f"floor. From here the lowest point may come down at most {room:.0f} mm (its clearance); "
+                          "aim at that or higher.")
             return
         best = np.maximum.accumulate(nominal)
         dips = np.flatnonzero(nominal[1:] < best[:-1] - RECOVERY_EPS_M)

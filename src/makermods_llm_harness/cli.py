@@ -6,14 +6,17 @@ at a time, or hand it to an MCP client or a model loop.
     llm-harness serve --robot bench           # one terminal; `op quit` or Ctrl-C ends it and rests the arms
     llm-harness op home                       # another terminal: one action, then the observation
     llm-harness op move_tool 0.3 0 0.15 --pitch -90
+    llm-harness py -c 'print(r.state().text())'   # code in the session's Python kernel
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib
 import json
 import math
+import os
 import shlex
 import signal
 import sys
@@ -27,14 +30,15 @@ import yaml
 
 from . import __version__
 from . import robot as robots
-from .actions import FRAMES, Observation
+from .actions import FRAMES, UNTIL, Observation
 from .backends.base import ARM_TYPES, OFF, ArmState
 from .harness import Harness
-from .log import EpisodeLog, latest_run, new_run_dir, read_episode, recorded_robot, runs_dir, summary
+from .log import (EpisodeLog, latest_run, new_run_dir, profile, profile_text, read_episode, recorded_robot, runs_dir,
+                  summary)
 from .robot import RobotError, SIM_BACKENDS
 from .safety import (REST_TOLERANCE_DEG, CalibrationError, Envelope, load_calibration, measure_table, save_calibration,
                      watch_for_touch)
-from .session import Client, Server, SessionError, default_address, ensure_free
+from .session import AddressLock, Client, PrivateSession, Server, SessionError, default_address, ensure_free
 
 ACTION_OPS = ("observe", "move_tool", "nudge", "gripper", "move_joints", "home", "rest", "wait")
 CONTROL_OPS = ("stop", "status", "describe", "quit")
@@ -44,19 +48,23 @@ MAX_TOUCH_OPENING = 0.1       # a table touch counts only with the jaws closed t
 REST_GAP_S = 0.3              # the rest pose is read twice this far apart ...
 REST_STILL_DEG = 0.5          # ... and both readings must agree this well
 CAMERA_WARMUP_S = 5.0     # how long `robot check` waits for every camera's first image
+QUIT_EXIT_S = 2.0         # after a quit has rested the arms of `mcp`, how long its loop gets to end before the exit
 
 VOCABULARY = """\
 actions (the same names as the MCP tools and the JSON actions):
   op observe                                   fresh camera images and arm state; moves nothing
-  op move_tool X Y Z [--pitch D] [--yaw D] [--roll D] [--arm A]
-  op nudge DX DY DZ [--frame base|tool] [--arm A]
+  op move_tool X Y Z [--pitch D] [--yaw D] [--roll D] [--joint-path] [--until contact] [--arm A]
+  op nudge DX DY DZ [--frame base|tool] [--until contact] [--arm A]
   op gripper open|close|0..1 [--arm A]
   op move_joints NAME=DEG ... [--relative] [--arm A]
   op home|rest [--arm A]
   op wait SECONDS
   op '{"action": "move_tool", "xyz": [0.3, 0, 0.1]}'   raw JSON action
+  move_tool, nudge, move_joints and home also take [--speed DEG_S | --duration S]; those and gripper
+  and rest take --dry-run (checked as they would be, nothing moves)
 session control:
   op stop | status | describe | quit
+Python kernel: llm-harness py -c CODE | llm-harness py < file.py | llm-harness py --wait [S]
 Metres, degrees, world frame (z up). Exit status: 0 done; 1 rejected, stopped or fault (the text says why);
 2 usage errors and no session running."""
 
@@ -117,27 +125,38 @@ def _op_parser() -> _Parser:
                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="op", required=True, metavar="OP")
 
-    def add(name: str, text: str, arm: bool = True) -> _Parser:
-        return sub.add_parser(name, help=text, description=text, parents=[_CLIENT, *([_ARM] if arm else [])])
+    def add(name: str, text: str, arm: bool = True, timing: bool = False) -> _Parser:
+        q = sub.add_parser(name, help=text, description=text, parents=[_CLIENT, *([_ARM] if arm else [])])
+        if timing:
+            how = q.add_mutually_exclusive_group()
+            how.add_argument("--speed", type=float, metavar="DEG_S", help="joint speed cap, below the envelope's")
+            how.add_argument("--duration", type=float, metavar="S", help="take about this long")
+        if arm:
+            q.add_argument("--dry-run", action="store_true", help="check it as it would be checked; nothing moves")
+        return q
 
     add("observe", "fresh camera images and arm state; moves nothing", arm=False)
-    q = add("move_tool", "move the tool point in a straight line to X Y Z (metres, world frame)")
+    q = add("move_tool", "move the tool point in a straight line to X Y Z (metres, world frame)", timing=True)
     for axis in "xyz":
         q.add_argument(axis, metavar=axis.upper(), type=float)
     q.add_argument("--pitch", type=float, metavar="DEG", help="tilt: -90 straight down, 0 horizontal (default: keep)")
     q.add_argument("--yaw", type=float, metavar="DEG", help="heading about the vertical (default: away from the base)")
     q.add_argument("--roll", type=float, metavar="DEG", help="turn about the pointing direction (default: keep)")
-    q = add("nudge", "move the tool point by DX DY DZ metres, keeping its orientation")
+    q.add_argument("--joint-path", action="store_true",
+                   help="move the joints straight to the pose instead of the tool point in a straight line")
+    q.add_argument("--until", choices=UNTIL, help="contact: end early, holding, where the arm stops following")
+    q = add("nudge", "move the tool point by DX DY DZ metres, keeping its orientation", timing=True)
     for axis in "xyz":
         q.add_argument(axis, metavar=f"D{axis.upper()}", type=float)
     q.add_argument("--frame", choices=FRAMES, default="base", help="base: the arm's x forward, y left, z up; "
                    "tool: the gripper's axes, z its pointing direction (default: base)")
+    q.add_argument("--until", choices=UNTIL, help="contact: end early, holding, where the arm stops following")
     q = add("gripper", "set the gripper opening: open, close, or 0 (closed) .. 1 (open)")
     q.add_argument("opening", type=_opening, metavar="open|close|0..1")
-    q = add("move_joints", "move joints by name to angles in degrees; the others stay")
+    q = add("move_joints", "move joints by name to angles in degrees; the others stay", timing=True)
     q.add_argument("joints", nargs="+", type=_joint, metavar="NAME=DEG")
     q.add_argument("--relative", action="store_true", help="add the angles to the current ones")
-    add("home", "move to the ready pose, raised and clear of the table")
+    add("home", "move to the ready pose, raised and clear of the table", timing=True)
     add("rest", "back to the rest pose, motors off (every arm unless --arm)")
     q = add("wait", "let SECONDS pass, then observe", arm=False)
     q.add_argument("seconds", type=float)
@@ -151,15 +170,17 @@ def _op_parser() -> _Parser:
 def _action(a: argparse.Namespace) -> dict:
     fields: dict = {"arm": getattr(a, "arm", None)}
     if a.op == "move_tool":
-        fields.update(xyz=[a.x, a.y, a.z], pitch_deg=a.pitch, yaw_deg=a.yaw, roll_deg=a.roll)
+        fields.update(xyz=[a.x, a.y, a.z], pitch_deg=a.pitch, yaw_deg=a.yaw, roll_deg=a.roll, until=a.until,
+                      line=False if a.joint_path else None)
     elif a.op == "nudge":
-        fields.update(dxyz=[a.x, a.y, a.z], frame=a.frame)
+        fields.update(dxyz=[a.x, a.y, a.z], frame=a.frame, until=a.until)
     elif a.op == "gripper":
         fields.update(opening=a.opening)
     elif a.op == "move_joints":
         fields.update(joints_deg=dict(a.joints), relative=a.relative)
     elif a.op == "wait":
         fields.update(seconds=a.seconds)
+    fields.update(speed_deg_s=getattr(a, "speed", None), duration_s=getattr(a, "duration", None))
     return {"action": a.op, **{k: v for k, v in fields.items() if v is not None}}
 
 
@@ -175,11 +196,17 @@ def parse_op(tokens: Sequence[str]) -> argparse.Namespace:
         return a
     a = _op_parser().parse_args(tokens)
     a.action = _action(a) if a.op in ACTION_OPS else None
+    a.dry_run = getattr(a, "dry_run", False)
     return a
 
 
 def _send(client: Client, op: argparse.Namespace, as_json: bool) -> int:
     """Run one parsed op on the session and print the outcome; the exit status."""
+    if op.action is not None and getattr(op, "dry_run", False):
+        result = client.check(op.action)
+        print(json.dumps(dataclasses.asdict(result)) if as_json else
+              f"{result.status}: {result.message}" if result.message else result.status)
+        return 0 if result.ok else 1
     if op.action is not None:
         try:
             obs = client.step(op.action)
@@ -223,6 +250,31 @@ def cmd_ops(args) -> int:
     return 0
 
 
+def cmd_py(args) -> int:
+    if args.code is not None:
+        code = args.code
+    elif args.wait is None:
+        if sys.stdin.isatty():
+            raise CommandError("py: give the code with -c CODE or on stdin, or --wait for the next report")
+        code = sys.stdin.read()
+    else:
+        code = ""
+    client = Client(args.address, timeout_s=args.timeout)
+    try:
+        reply = client.py(code, args.wait, timeout_s=args.timeout)
+    except KeyboardInterrupt:
+        client.stop()
+        print("interrupted: stop sent; the arm holds where it is", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(reply))
+    else:
+        from .kernel import format_reply
+        print(format_reply(reply))
+    client.ack()                             # the reports printed here are not sent again
+    return 1 if reply["error"] else 0
+
+
 def cmd_rest(args) -> int:
     return _send(Client(args.address), argparse.Namespace(op="rest", action={"action": "rest"}), args.json)
 
@@ -255,11 +307,11 @@ def _open_logged(robot: robots.Robot, log: EpisodeLog, **options) -> Harness:
 
 
 class Lifecycle:
-    """Owns a harness the CLI opened. While inside it, SIGINT and SIGTERM raise KeyboardInterrupt in the main
-    thread (motions run on other threads); leaving it ignores further signals, closes the server's admission
-    (``server``), stops the action in progress, waits for running requests, rests and closes the harness, and
-    reports each arm's torque outcome (``outcomes``; ``code`` 0 when all are off). A KeyboardInterrupt ends the
-    block quietly."""
+    """Owns a harness the CLI opened, and its session (``server``) when there is one. While inside it, SIGINT and
+    SIGTERM raise KeyboardInterrupt in the main thread (motions run on other threads). Leaving it, by any way out
+    (an exception, a signal, a quit, the end of the block), runs ``close_session``, ignoring further signals until
+    it is done. A KeyboardInterrupt ends the block quietly; any other exception goes on after the arms are dealt
+    with."""
 
     def __init__(self, harness: Harness, server: Optional[Server] = None, say: Callable[[str], None] = print):
         self.harness, self.server, self.say = harness, server, say
@@ -267,6 +319,15 @@ class Lifecycle:
         self.code = 1                          # 0 once every arm is confirmed off (or a simulator's)
         self.interrupted = False
         self._previous: dict = {}
+        self._closing = threading.Lock()
+        self._closed = False
+
+    def close_now(self) -> None:
+        """Run ``close_session`` once, from any thread (a quit's own, for an owner that cannot be woken)."""
+        with self._closing:
+            if not self._closed:
+                self.outcomes, self.code = close_session(self.harness, self.server, self.say)
+                self._closed = True
 
     def __enter__(self) -> "Lifecycle":
         if threading.current_thread() is threading.main_thread():
@@ -281,20 +342,62 @@ class Lifecycle:
         try:
             if exc_type is KeyboardInterrupt:
                 self.interrupted = True
-                self.say("interrupted; resting the arms")
-            if self.server is not None:
-                self.server.shutdown()
-            self.harness.stop()
-            if self.server is not None:
-                self.server.drain()
-            self.outcomes = self.harness.close()
-            self.code = report_outcomes(self.outcomes, self.say, getattr(self.harness.backend, "recovery", None))
-            if self.server is not None:
-                self.server.finish(self.outcomes)
+                _best_effort(self.say)("interrupted; resting the arms")
+            self.close_now()
         finally:
             for name, handler in self._previous.items():
                 signal.signal(getattr(signal, name), handler)
         return exc_type is KeyboardInterrupt
+
+
+def close_session(harness: Harness, server: Optional[Server] = None,
+                  say: Callable[[str], None] = print) -> tuple[dict[str, str], int]:
+    """The one way a session the CLI owns ends. The session's part (shutdown phase, kernel ended) comes first and
+    its failures are only reported; the arms' part always runs after it, whatever failed before: a confirmed hold,
+    the requests still running drained, every arm rested and released (``Harness.close``: backend closed, episode
+    log ended), each arm's outcome reported and handed to a waiting quit, and last the address given up. Every
+    line it prints is best-effort (``say`` failing, a closed stdout, changes nothing). Returns the outcomes and the
+    exit code (0 when every arm is off)."""
+    say = _best_effort(say)
+    outcomes: dict[str, str] = {}
+    try:
+        if server is not None:
+            server.shutdown()
+            for problem in server.shutdown_problems:
+                say(f"shutdown: {problem}")
+    except Exception as e:
+        say(f"shutdown: the session did not close cleanly ({type(e).__name__}: {e}); resting the arms anyway")
+    finally:
+        try:
+            try:
+                problem = harness.stop()
+                if problem:
+                    say(f"shutdown: the hold before the rest is not confirmed: {problem}")
+            except Exception as e:
+                say(f"shutdown: the hold before the rest failed ({type(e).__name__}: {e})")
+            if server is not None:
+                try:
+                    server.drain()
+                except Exception as e:
+                    say(f"shutdown: running requests were not drained ({type(e).__name__}: {e})")
+            outcomes = harness.close()
+            report_outcomes(outcomes, say, getattr(harness.backend, "recovery", None))
+            if server is not None:
+                server.finish(outcomes)
+        finally:
+            if server is not None:
+                server.release()
+    return outcomes, 0 if outcomes and all(w in OFF for w in outcomes.values()) else 1
+
+
+def _best_effort(say: Callable[[str], None]) -> Callable[[str], None]:
+    def write(line: str) -> None:
+        try:
+            say(line)
+        except Exception:
+            pass
+    return write
+
 
 def _interrupt(signum, frame):
     raise KeyboardInterrupt
@@ -310,6 +413,8 @@ def report_outcomes(outcomes: dict[str, str], say: Callable[[str], None] = print
     for name, word in outcomes.items():
         if word == "released":
             say(f"{name}: at rest, motors off.")
+        elif word == "released_unrested":
+            say(f"{name}: motors off where the operator supports it; it is NOT at its rest pose.")
         elif word == "always_on":
             say(f"{name}: at rest (simulated: its motors are always on).")
         else:
@@ -345,20 +450,25 @@ def serve(robot: robots.Robot, address: Optional[str] = None, run_dir: Optional[
     if attach and robot.backend != "real":
         raise CommandError("--attach is for real arms")
     address = address or default_address()
-    ensure_free(address)                     # before any device opens
-    harness = _open_logged(robot, _episode_log(robot.name, run_dir, resume), read_only=read_only,
-                           backend_options={"attach": True} if attach else None)
+    lock = AddressLock(address)              # owned before any device opens, until the server has cleaned up
+    try:
+        ensure_free(address)
+        harness = _open_logged(robot, _episode_log(robot.name, run_dir, resume), read_only=read_only,
+                               backend_options={"attach": True} if attach else None)
+    except BaseException:
+        lock.release()
+        raise
     if sys.stdin.isatty() and hasattr(harness.backend, "ask_operator"):
         harness.backend.ask_operator = _ask_operator
     try:
-        server = Server(harness, address, say=_say_stderr, reports_close=True)
+        server = Server(harness, address, say=_say_stderr, reports_close=True, lock=lock)
     except BaseException:
         report_outcomes(harness.close())
         raise
     print(harness.describe())
     print(f"\nSession at {server.address}; run directory {harness.log.run_dir} (step {harness.steps}).")
-    print("Drive it with `llm-harness op ...`; `llm-harness op quit` or Ctrl-C ends it and rests the arms.",
-          flush=True)
+    print("Drive it with `llm-harness op ...` or `llm-harness py`; `llm-harness op quit` or Ctrl-C ends it and "
+          "rests the arms.", flush=True)
     with Lifecycle(harness, server) as life:
         server.serve_forever()
     return life.code
@@ -617,7 +727,8 @@ def _optional_module(name: str, extra: str):
 
 
 def _target(args):
-    """A session Client (--connect) or a Harness opened with a new episode log."""
+    """A session Client (--connect), or a ``PrivateSession`` on a robot opened here with a new episode log: the
+    model then reaches it through a session of this process's own, as it would a served one."""
     if args.connect is not None:
         return Client(args.connect or None)
     if args.sim or args.mujoco:
@@ -626,17 +737,40 @@ def _target(args):
         robot = robots.load(args.robot)
     harness = _open_logged(robot, EpisodeLog(new_run_dir(robot.name)))
     print(f"run directory {harness.log.run_dir}", file=sys.stderr)
-    return harness
+    try:
+        session = PrivateSession(harness)
+        print(f"session at {session.server.address}", file=sys.stderr, flush=True)
+        return session
+    except BaseException:
+        report_outcomes(harness.close(), _say_stderr)
+        raise
 
 
 def cmd_mcp(args) -> int:
     mcp_server = _optional_module("mcp_server", "mcp")
     target = _target(args)
-    if not isinstance(target, Harness):
+    if isinstance(target, Client):
         mcp_server.run(target)
         return 0
-    with Lifecycle(target, say=_say_stderr) as life:       # stdout carries the MCP protocol
-        mcp_server.run(target)
+    stops = []
+
+    def quit_now(life: Lifecycle) -> None:
+        """A quit: rest and release here (its reply waits for the outcomes), then end serving. The stdio loop may
+        be blocked reading an idle stdin, so the process ends once the arms are dealt with."""
+        def close() -> None:
+            life.close_now()
+            for stop in stops:
+                stop()
+            time.sleep(QUIT_EXIT_S)
+            os._exit(life.code)
+        threading.Thread(target=close, daemon=True).start()
+
+    try:
+        with Lifecycle(target.harness, target.server, say=_say_stderr) as life:   # stdout carries the MCP protocol
+            target.server.on_quit = lambda: quit_now(life)
+            mcp_server.run(target.client, on_ready=stops.append)
+    finally:
+        target.cleanup()
     return life.code
 
 
@@ -644,15 +778,18 @@ def cmd_run(args) -> int:
     agent = _optional_module("agent", "agent")
     options = {"max_steps": args.max_steps, "timeout_s": args.timeout, **({"model": args.model} if args.model else {})}
     target = _target(args)
-    if not isinstance(target, Harness):
+    if isinstance(target, Client):
         result = agent.run(target, args.task, **options)
         print(f"{result.status} after {result.steps} steps: {result.message}")
         return 0 if result.status == "done" else 1
     result = None
-    with Lifecycle(target) as life:
-        target.log.note(f"task: {args.task}")
-        result = agent.run(target, args.task, **options)
-        print(f"{result.status} after {result.steps} steps: {result.message}")
+    try:
+        with Lifecycle(target.harness, target.server) as life:
+            target.harness.log.note(f"task: {args.task}")
+            result = agent.run(target.client, args.task, **options)
+            print(f"{result.status} after {result.steps} steps: {result.message}")
+    finally:
+        target.cleanup()
     return 0 if result is not None and result.status == "done" and life.code == 0 else 1
 
 
@@ -684,6 +821,12 @@ def cmd_log_show(args) -> int:
             result = e.get("observation", {}).get("result", {})
             message = f": {result['message']}" if result.get("message") else ""
             print(f"{e.get('step'):>4}  {_action_text(e.get('action'))} -> {result.get('status', '?')}{message}")
+    return 0
+
+
+def cmd_log_profile(args) -> int:
+    path = _run_dir(args.run_dir)
+    print(json.dumps(profile(path)) if args.json else profile_text(path, steps=not args.brief))
     return 0
 
 
@@ -778,6 +921,17 @@ def build_parser() -> _Parser:
     q.set_defaults(func=cmd_ops)
     q = sub.add_parser("rest", parents=[_CLIENT], help="rest every arm of the session (op rest)")
     q.set_defaults(func=cmd_rest)
+    q = sub.add_parser("py", parents=[_CLIENT], help="run Python in the session's kernel (code on stdin or -c)",
+                       description="Run Python in the session's persistent kernel and print what it printed, one "
+                       "line of state per arm, the action queue and the reports of queued actions that finished "
+                       "since the last call. The code comes from -c, else from stdin (not read with --wait). The "
+                       "kernel runs code as the user who started the session; only that user can reach it.")
+    q.add_argument("-c", dest="code", metavar="CODE", help="the code (default: read stdin)")
+    q.add_argument("--wait", nargs="?", type=float, const=60.0, metavar="S",
+                   help="then wait up to S seconds (default 60) for the next report, or for the queue to empty")
+    q.add_argument("--timeout", type=float, default=300.0, metavar="S",
+                   help="longest the code may run before this gives up waiting (default 300)")
+    q.set_defaults(func=cmd_py)
 
     target = argparse.ArgumentParser(add_help=False, parents=[sim_options])
     which = target.add_mutually_exclusive_group()
@@ -800,6 +954,11 @@ def build_parser() -> _Parser:
     q = lsub.add_parser("show", help="the steps of a run: action and result")
     q.add_argument("run_dir", nargs="?", metavar="RUN_DIR", help="default: the latest run")
     q.set_defaults(func=cmd_log_show)
+    q = lsub.add_parser("profile", help="where a run's time went: steps, motion, idle gaps, kernel actions")
+    q.add_argument("run_dir", nargs="?", metavar="RUN_DIR", help="default: the latest run")
+    q.add_argument("--brief", action="store_true", help="totals only, without the per-step table")
+    q.add_argument("--json", action="store_true", help="print the numbers as JSON")
+    q.set_defaults(func=cmd_log_profile)
     q = lsub.add_parser("resume", help="what a fresh agent needs to take over a run")
     q.add_argument("run_dir", nargs="?", metavar="RUN_DIR", help="default: the latest run")
     q.set_defaults(func=cmd_log_resume)

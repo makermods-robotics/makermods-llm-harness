@@ -5,7 +5,9 @@ whose model calls the same actions as tools. The [operator section](#operator) a
 starts the robot and keeps a hand on the emergency stop.
 
 The CLI forms are shown. Over MCP the tool names and fields are the same (`move_tool` with `xyz`, `pitch_deg`, ...)
-and the images come back inline instead of as paths.
+and the images come back inline instead of as paths. For faster episodes, drive the session from its Python kernel
+instead (`llm-harness py`, the MCP tool `run_python`): motions are queued as actions that run while the next ones are
+prepared. [AGENT_GUIDE.md](AGENT_GUIDE.md) is the guide for that.
 
 ## The loop
 
@@ -23,6 +25,15 @@ llm-harness ops "nudge 0 0 -0.02" "gripper close"
 ```
 
 Do not chain `op` calls with `;` in the shell for the same reason.
+
+Two flags save steps: `--dry-run` checks a motion exactly as it would be checked and moves nothing, and
+`--until contact` on `move_tool` or `nudge` ends the move where the arm stops on something, instead of descending a
+centimetre at a time:
+
+```bash
+llm-harness op move_tool 0.28 0 0.12 --pitch -90 --dry-run
+llm-harness op nudge 0 0 -0.08 --until contact
+```
 
 ## Reading an observation
 
@@ -158,7 +169,7 @@ misremembered height ends somewhere else.
 |---|---|---|
 | `done` | the action finished; the numbers are measured. A tool move is done only within 10 mm and 3 deg of its target; `--json` gives how far off it ended under `result.error`. | look, then decide |
 | `rejected` | refused before anything moved | read the message: it names the rule and usually the fix. Change the request; repeating it gets the same answer. |
-| `stopped` | ended early: `op stop`, a joint more than 6 deg off its path (blocked, maybe by a collision), a measured point more than 10 mm under the floor or inside a keep-out zone, a motor over the temperature limit, a motion that did not arrive, a tool move that `ended X mm and Y deg from the target`, or a rest that ended without release. The arm holds where it is. | look at every camera before the next move. If it was blocked, find out by what. |
+| `stopped` | ended early: `op stop`, a joint more than 6 deg off its path (blocked, maybe by a collision), a measured point more than 10 mm under the floor or inside a keep-out zone, a motor over the temperature limit, a motion that did not arrive, a tool move that `ended X mm and Y deg from the target` (up to 30 mm that the arm's sag explains is `done`, with the miss in the message), or a rest that ended without release. The arm holds where it is. | look at every camera before the next move. If it was blocked, find out by what. |
 | `fault` | an arm reports a fault | stop sending actions and tell the operator what you did and saw |
 
 Common rejections:
@@ -168,7 +179,7 @@ Common rejections:
 | `would move N deg in one action, over the 35 deg per-action limit` | split the motion: smaller position steps, or change the pitch by 20-30 deg at a time |
 | `that pose is out of reach (the closest reachable pose is ...)` | choose a closer point or another pitch |
 | `the straight path to that pose ends ... off it` | go through an intermediate point |
-| `... mm allowing for tracking error and sag), under the 0 mm hard floor. Aim higher.` | target a higher z |
+| `... under the 0 mm hard floor. From here the lowest point may come down at most N mm (its clearance) ...` | aim at most N mm lower than now (with `--until contact` too) |
 | `would bring the ... into keep-out zone NAME ... Go around it` | the path crosses a zone (`op describe` gives its corners): move away from it first, then approach the target from another side |
 | `inside keep-out zone NAME ... only motions that keep moving out of the zone` | the arm is already in the zone: move straight away from it first |
 | `under the 0 mm hard floor once tracking error and sag are allowed for ... only motions that keep gaining height` | the arm is already too low: lift first, `op nudge 0 0 0.02` |
@@ -183,7 +194,8 @@ Common rejections:
 
 - One action may move no joint more than 35 deg from where it started (`home` and `rest` are exempt). Large tool moves
   and large changes of pitch or yaw touch several joints at once: changing the pitch by more than about 20-30 deg in
-  one action tends to exceed the cap. Split them and look in between.
+  one action tends to exceed the cap. Split them; `r.reachable(poses, chain=True)` in the kernel checks a whole
+  sequence in one call.
 - Turning the gripper far about its axis: `op move_joints wrist_roll=30 --relative`, repeated.
 - The hard floor (0 mm by default: the arm may touch the table) applies at every waypoint, not only at the end, to
   the elbow and wrist joints, the tool point, the fingertips and the tips of the fully open jaws (`op describe` gives
@@ -198,7 +210,8 @@ Common rejections:
   `keep-out zone NAME D m away` shows how close the arm is. A refused path has to go around: move away from the
   zone, then approach from another side. An arm already inside may only move out; entering one while moving holds
   the arm.
-- Joints move at up to 20 deg/s, and at 5 deg/s when a motion starts or passes within 76 mm of the table.
+- Joints move at up to 20 deg/s, and at 5 deg/s when a motion starts or passes within 76 mm of the table (the robot
+  file may set other speeds; `op describe` states the ones in force).
 - An arm already under the floor accepts only motions that keep gaining height.
 - `rest` moves to the rest pose along a checked path, by way of `home` when the straight path would cross the floor.
   When both are refused nothing moves: lift, then rest again. An arm with a fault is not moved.
@@ -222,11 +235,13 @@ llm-harness op rest
 
 | Command | Effect |
 |---|---|
-| `llm-harness op status` | robot, arms, cameras, step count, run directory, whether an action is running; touches no device |
+| `llm-harness op status` | robot, arms, cameras, step count, run directory, whether an action or a queued kernel action is running, the kernel's queue; touches no device |
 | `llm-harness op describe` | the robot description |
-| `llm-harness op stop` | ends the action in progress and any sent while it ran; the arm holds where it is (`stopped`). Ctrl-C on a waiting `op` sends it too. |
+| `llm-harness op stop` | ends the action in progress and any sent while it ran, and the kernel's running code and queue; answers once every arm that is on holds where it is, confirmed, or with what could not be confirmed. Ctrl-C on a waiting `op` sends it too. |
 | `llm-harness rest` | every arm back to rest, motors off (`op rest --arm left` for one) |
 | `llm-harness op quit` | ends the session: the server rests the arms, then the command prints each arm's outcome (exit 1 when one is not confirmed off) |
+| `llm-harness py -c CODE`, `llm-harness py < file.py` | runs code in the session's Python kernel ([AGENT_GUIDE.md](AGENT_GUIDE.md)); `--timeout S` (300) bounds how long it may run, after which the kernel restarts empty |
+| `llm-harness py --wait [S]` | waits up to S seconds (60) for the next report of a queued action, or until nothing runs or waits |
 
 Finish a task with `llm-harness rest`, then report.
 
@@ -238,6 +253,7 @@ are next to it. To take over a task someone else started:
 ```bash
 llm-harness log resume       # robot, task notes, step count, last five actions, last observation and images
 llm-harness log show         # every step: action -> result
+llm-harness log profile      # where the time went: in steps, motion, idle gaps, per action, kernel actions
 ```
 
 Both read the latest run, or the run directory given as an argument. The operator can continue the same episode in
@@ -274,6 +290,25 @@ The arms are connected with their torque as it is. An arm's motors come on, hold
 or gripper action that the envelope accepts, and only within 5 deg (every joint) of its recorded rest pose; a refused
 request leaves them off, and before the table is calibrated every action except `observe` and `wait` is refused.
 Keep the workspace clear and a hand on the hardware emergency stop while an agent drives.
+
+The session's Python kernel (`llm-harness py`, MCP `run_python`) runs model code as the user who started `serve`,
+with all of that user's rights: it is not sandboxed. It runs in a separate process the session starts and can kill,
+and reaches the robot only through the session's kernel channel, where everything that moves or queues needs an
+authority the session revokes on `op stop`, a hang-up, a timeout or shutdown. `op stop` answers once every arm that
+is on holds where it is, confirmed from fresh feedback, or answers what could not be confirmed. `op quit`, Ctrl-C or
+SIGTERM on `serve`, or an error in it, revoke everything, hold and confirm, end the kernel process (killed after 1 s)
+and only then rest and release the arms; nothing else can move them from then on, and the address stays taken until
+each arm's outcome is printed. `mcp` and `run` without `--connect` print their session's address (`session at ...`) on
+stderr, so `op stop --address` and `op quit --address` reach them; a quit there rests the arms and ends the process. Every connection must answer a challenge with the session key
+(`<socket>.key`, readable only by you). The kernel is not available on Windows.
+
+### Speed settings
+
+Every setting that costs time lives in the robot file's `safety:` block (defaults in the README's safety section):
+`max_speed_deg_s`, `slow_speed_deg_s`, `slow_zone_m`, `max_excursion_deg`, `settle_s`, `tracking_tolerance_deg` and
+`tracking_lag_s`, plus `contact_tolerance_m` for `until contact`. When you raise the speeds, keep `tracking_lag_s` at
+least as long as the arm trails its command, or fast motions stop as blocked. Compare episodes with
+`llm-harness log profile`.
 
 ### Keep-out zones
 

@@ -90,7 +90,7 @@ class SimBackend(Backend):
     def table_z(self) -> Optional[float]:
         return self._table_z
 
-    def enable(self, arm: str, cancel=None) -> None:
+    def enable(self, arm: str, cancel=None, speed=None) -> None:
         a = self._arms[arm]
         if a.fault:
             raise RuntimeError(f"{arm} cannot be enabled: {a.fault}")

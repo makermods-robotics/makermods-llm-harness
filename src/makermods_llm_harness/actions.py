@@ -35,13 +35,20 @@ class MoveTool:
     pitch_deg is the tilt of the gripper's pointing direction (-90 straight down, 0 horizontal; default:
     keep the current tilt). yaw_deg is its compass heading about the vertical (default: pointing away
     from the arm's base). roll_deg turns the gripper about its pointing direction (default: keep).
-    A path into a keep-out zone (listed in the robot description) is rejected: go around it."""
+    A path into a keep-out zone (listed in the robot description) is rejected: go around it. With line false
+    the joints move straight to the pose instead (the tool point then sweeps a curve). until "contact" ends the
+    move early, holding, where the arm stops following its command. speed_deg_s caps the joint speed below the
+    envelope's; duration_s stretches the move to about that long."""
     name: ClassVar[str] = "move_tool"
     xyz: tuple[float, float, float]
     pitch_deg: Optional[float] = None
     yaw_deg: Optional[float] = None
     roll_deg: Optional[float] = None
     arm: Optional[str] = None
+    line: Optional[bool] = None
+    until: Optional[str] = None
+    speed_deg_s: Optional[float] = None
+    duration_s: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -50,17 +57,20 @@ class Nudge:
     axes (x forward, y left, z up); frame "tool" uses the gripper's own axes (z is its pointing direction).
     The offset is added to the last commanded tool pose while the arm holds still within 10 mm and 3 deg of
     it, so repeated small nudges add up; after a stop or fault, or when the arm is further off, it is added
-    to the measured pose."""
+    to the measured pose. until, speed_deg_s and duration_s work as for move_tool."""
     name: ClassVar[str] = "nudge"
     dxyz: tuple[float, float, float]
     frame: str = "base"
     arm: Optional[str] = None
+    until: Optional[str] = None
+    speed_deg_s: Optional[float] = None
+    duration_s: Optional[float] = None
 
 
 @dataclass(frozen=True)
 class Gripper:
     """Set the gripper opening: 0 closed, 1 fully open ("open" and "close" also work). The observation
-    reports the opening actually reached; staying above the request means the jaws hold something."""
+    reports the opening actually reached, and the result says whether the jaws stopped on something."""
     name: ClassVar[str] = "gripper"
     opening: float
     arm: Optional[str] = None
@@ -74,6 +84,8 @@ class MoveJoints:
     joints_deg: dict[str, float]
     relative: bool = False
     arm: Optional[str] = None
+    speed_deg_s: Optional[float] = None
+    duration_s: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +93,8 @@ class Home:
     """Move to the ready pose: gripper forward, above the table."""
     name: ClassVar[str] = "home"
     arm: Optional[str] = None
+    speed_deg_s: Optional[float] = None
+    duration_s: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -101,9 +115,19 @@ Action = Union[Observe, MoveTool, Nudge, Gripper, MoveJoints, Home, Rest, Wait]
 ACTIONS: dict[str, type] = {cls.name: cls for cls in (Observe, MoveTool, Nudge, Gripper, MoveJoints, Home, Rest, Wait)}
 FRAMES = ("base", "tool")
 MAX_WAIT_S = 30.0
+MAX_DURATION_S = 60.0
+MIN_SPEED_DEG_S = 0.5
+UNTIL = ("contact",)
+MOTIONS = ("move_tool", "nudge", "move_joints", "home")    # the actions that take speed_deg_s and duration_s
 
 _ARM = {"type": "string", "description": "Arm name. Optional when the robot has one arm."}
 _XYZ = {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}
+_SPEED = {"speed_deg_s": {"type": "number", "minimum": MIN_SPEED_DEG_S,
+                          "description": "Joint speed cap in deg/s, below the envelope's limit."},
+          "duration_s": {"type": "number", "exclusiveMinimum": 0, "maximum": MAX_DURATION_S,
+                         "description": "Take about this long (longer when the speed limits need it)."}}
+_UNTIL = {"until": {"type": "string", "enum": list(UNTIL),
+                    "description": "contact: end early, holding, where the arm stops following its command."}}
 _PROPERTIES: dict[str, dict[str, Any]] = {
     "observe": {},
     "move_tool": {
@@ -113,11 +137,15 @@ _PROPERTIES: dict[str, dict[str, Any]] = {
         "yaw_deg": {"type": "number", "description": "Heading of the pointing direction about the vertical."},
         "roll_deg": {"type": "number", "description": "Turn of the gripper about its pointing direction."},
         "arm": _ARM,
+        "line": {"type": "boolean", "default": True,
+                 "description": "true: the tool point moves in a straight line; false: the joints move straight."},
+        **_UNTIL, **_SPEED,
     },
     "nudge": {
         "dxyz": {**_XYZ, "description": "Offset in metres along the frame's x, y, z."},
         "frame": {"type": "string", "enum": list(FRAMES), "default": "base"},
         "arm": _ARM,
+        **_UNTIL, **_SPEED,
     },
     "gripper": {
         "opening": {"anyOf": [{"type": "number", "minimum": 0, "maximum": 1}, {"type": "string", "enum": ["open", "close"]}],
@@ -129,8 +157,9 @@ _PROPERTIES: dict[str, dict[str, Any]] = {
                        "description": "Joint name -> angle in degrees."},
         "relative": {"type": "boolean", "default": False},
         "arm": _ARM,
+        **_SPEED,
     },
-    "home": {"arm": _ARM},
+    "home": {"arm": _ARM, **_SPEED},
     "rest": {"arm": _ARM},
     "wait": {"seconds": {"type": "number", "minimum": 0, "maximum": MAX_WAIT_S, "default": 1.0}},
 }
@@ -191,6 +220,32 @@ def _optional(raw: dict, key: str) -> Optional[float]:
     return None if raw.get(key) is None else _number(raw[key], key)
 
 
+def _timing(name: str, raw: dict) -> dict:
+    """``speed_deg_s`` and ``duration_s`` of a motion, checked; at most one of them."""
+    speed, duration = _optional(raw, "speed_deg_s"), _optional(raw, "duration_s")
+    if speed is not None and duration is not None:
+        raise ActionError(f"{name}: give speed_deg_s or duration_s, not both")
+    if speed is not None and speed < MIN_SPEED_DEG_S:
+        raise ActionError(f"speed_deg_s must be at least {MIN_SPEED_DEG_S:g}, got {speed:g}")
+    if duration is not None and not 0 < duration <= MAX_DURATION_S:
+        raise ActionError(f"duration_s must be above 0 and at most {MAX_DURATION_S:g}, got {duration}")
+    return {"speed_deg_s": speed, "duration_s": duration}
+
+
+def _until(raw: dict) -> Optional[str]:
+    until = raw.get("until")
+    if until is not None and until not in UNTIL:
+        raise ActionError(f"until must be one of {', '.join(UNTIL)}, got {_show(until)}")
+    return until
+
+
+def _flag(raw: dict, key: str) -> Optional[bool]:
+    value = raw.get(key)
+    if value is not None and not isinstance(value, bool):
+        raise ActionError(f"{key} must be true or false, got {_show(value)}")
+    return value
+
+
 def parse_action(raw: Union[Action, dict, str]) -> Action:
     """An action from its JSON object, JSON text or typed instance, all checked the same way. A field that is
     omitted or null takes its default. ActionError says what is wrong."""
@@ -222,12 +277,13 @@ def parse_action(raw: Union[Action, dict, str]) -> Action:
         pitch = _optional(raw, "pitch_deg")
         if pitch is not None and not -90 <= pitch <= 90:
             raise ActionError(f"pitch_deg must be between -90 (straight down) and 90, got {pitch}")
-        return MoveTool(_triple(raw["xyz"], "xyz"), pitch, _optional(raw, "yaw_deg"), _optional(raw, "roll_deg"), arm)
+        return MoveTool(_triple(raw["xyz"], "xyz"), pitch, _optional(raw, "yaw_deg"), _optional(raw, "roll_deg"), arm,
+                        _flag(raw, "line"), _until(raw), **_timing(name, raw))
     if name == "nudge":
         frame = raw.get("frame", "base")
         if not isinstance(frame, str) or frame not in FRAMES:
             raise ActionError(f"frame must be one of {', '.join(FRAMES)}, got {_show(frame)}")
-        return Nudge(_triple(raw["dxyz"], "dxyz"), frame, arm)
+        return Nudge(_triple(raw["dxyz"], "dxyz"), frame, arm, _until(raw), **_timing(name, raw))
     if name == "gripper":
         opening = {"open": 1.0, "close": 0.0, "closed": 0.0}.get(raw["opening"]) if isinstance(raw["opening"], str) \
             else _number(raw["opening"], "opening")
@@ -242,9 +298,10 @@ def parse_action(raw: Union[Action, dict, str]) -> Action:
         relative = raw.get("relative", False)
         if not isinstance(relative, bool):
             raise ActionError(f"relative must be true or false, got {_show(relative)}")
-        return MoveJoints({k: _number(v, f"joints_deg.{k}") for k, v in joints.items()}, relative, arm)
+        return MoveJoints({k: _number(v, f"joints_deg.{k}") for k, v in joints.items()}, relative, arm,
+                          **_timing(name, raw))
     if name == "home":
-        return Home(arm)
+        return Home(arm, **_timing(name, raw))
     if name == "rest":
         return Rest(arm)
     seconds = _number(raw.get("seconds", 1.0), "seconds")
@@ -269,11 +326,16 @@ class Result:
     """How the last action ended. ``status`` is "done", "rejected" (refused before anything moved: fix the
     request and try again), "stopped" (ended early, the arm holds where it is) or "fault" (the arm reports
     a fault). ``message`` explains anything but "done" in plain words. ``error``: after a tool move, how far the
-    measured tool pose ended from the requested one, ``{"position_m", "angle_deg"}``."""
+    measured tool pose ended from the requested one, ``{"position_m", "angle_deg"}``. ``contact``: a move with
+    until "contact" that ended on contact, ``{"xyz", "short_m"}`` (where the tool point stopped, how far short of
+    the target). ``grip``: after a gripper action, ``{"opening", "target", "holding"}`` (the measured and the
+    requested opening, and whether the jaws stopped on something)."""
     status: str = "done"
     message: str = ""
     action: Optional[dict[str, Any]] = None
     error: Optional[dict[str, float]] = None
+    contact: Optional[dict[str, Any]] = None
+    grip: Optional[dict[str, Any]] = None
 
     @property
     def ok(self) -> bool:

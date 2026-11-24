@@ -18,6 +18,7 @@ from .backends.base import ArmInfo
 from .robot import sdk
 
 MIN_SECONDS = 0.25          # shortest planned move
+MAX_SECONDS = 120.0         # longest planned move: no plan holds more waypoints than this at its rate
 PLAN_STEP = math.radians(2.0)   # largest joint step per IK planning tick
 POSE_TOL_M = 0.005          # a planned tool path must end this close to the requested pose ...
 POSE_TOL_DEG = 2.0          # ... and within this angle of it
@@ -132,6 +133,7 @@ class ArmModel:
         self.lo = np.array([j.lo for j in joints[:6]])
         self.hi = np.array([j.hi for j in joints[:6]])
         self.home_q = np.array(self.config.ik["rest_pose"], dtype=float)
+        self.raised_q = self.home_q.copy()         # the SDK's raised pose: the IK seed and the way round to rest
         self.rate_hz = float(self.config.control_rate_hz)
         c, s = math.cos(info.base_yaw), math.sin(info.base_yaw)
         self.world_from_base = np.eye(4)
@@ -143,7 +145,7 @@ class ArmModel:
         nodes = ["base"] + [f"{self.joint_names[k - 1]} joint" for k in LINKS_AFTER] + ["tool point"]
         segments = [(i, i + 1, f"link from the {nodes[i]} to the {nodes[i + 1]}") for i in range(len(nodes) - 1)]
         segments += [(6, 7, "fingers"), (10, 8, "open jaws"), (11, 9, "open jaws"), (8, 9, "open jaw tips")]
-        at_home = self._body_nodes(self.home_q[None])[0]
+        at_home = self._body_nodes(self.raised_q[None])[0]
         a, b, frac, self.body_names = [], [], [], []
         for i, j, label in segments:
             n = max(1, int(math.ceil(np.linalg.norm(at_home[j] - at_home[i]) / SAMPLE_M)))
@@ -152,6 +154,14 @@ class ArmModel:
             frac += list(np.linspace(0.0, 1.0, n + 1))
             self.body_names += [label] * (n + 1)
         self._body = (np.array(a), np.array(b), np.array(frac)[:, None])
+
+    def set_home(self, xyz, pitch_deg: float) -> None:
+        """Make ``home`` the pose with the tool point at ``xyz`` (the arm's base frame, m) pointing straight ahead
+        at ``pitch_deg``; Unreachable when the arm cannot take it."""
+        target = np.eye(4)
+        target[:3, :3] = rotation_from_angles(math.radians(pitch_deg), 0.0, 0.0)
+        target[:3, 3] = np.asarray(xyz, dtype=float)
+        self.home_q = np.asarray(self._solve(self.raised_q, target).q, dtype=float)
 
     # ── poses ──
     def tool_pose(self, q) -> np.ndarray:
@@ -178,6 +188,11 @@ class ArmModel:
         g = self.gripper
         tips = self._gripper_points(q, g.finger_length_m + g.margin_m, g.jaw_half_width_m + g.margin_m)
         return np.concatenate([links, tips], axis=-2)
+
+    def tool_points(self, q) -> np.ndarray:
+        """World xyz of the tool point: (3,) for one q, (T, 3) for a path."""
+        pts = self.world_from_base @ self.chain.fk_jacobian_many(np.atleast_2d(np.asarray(q, dtype=float)))[0]
+        return pts[0, :3, 3] if np.ndim(q) == 1 else pts[:, :3, 3]
 
     def fingertip(self, q) -> np.ndarray:
         """World xyz of the point midway between the fingertips (no margin): what touches the table."""
@@ -243,10 +258,29 @@ class ArmModel:
         q0, q1 = np.asarray(q0, dtype=float), np.asarray(q1, dtype=float)
         span = float(np.max(np.abs(q1 - q0)))
         # Minimum jerk peaks at 1.875x the mean speed.
-        ticks = max(int(math.ceil(MIN_SECONDS * rate_hz)), int(math.ceil(1.875 * span * rate_hz / speed_rad_s * 1.01)))
+        ticks = max(MIN_SECONDS * rate_hz, 1.875 * span * rate_hz / speed_rad_s * 1.01)
+        limit_ticks(self.name, ticks, rate_hz)
+        ticks = int(math.ceil(ticks))
         path = q0 + minimum_jerk(ticks)[:, None] * (q1 - q0)
         path[-1] = q1
         return path
+
+    def _solve(self, q0, target: np.ndarray):
+        """The SDK IK solution for ``target`` (4x4, base frame) seeded from ``q0`` and home; Unreachable when it
+        misses by more than POSE_TOL_M or POSE_TOL_DEG."""
+        lo, hi = self.ik.bounds(q0)
+        end = min((self.chain.ik(target, np.clip(seed, lo, hi), limits=(lo, hi)) for seed in (q0, self.raised_q)),
+                  key=lambda r: (not within_pose_tol(r.pos_err, r.rot_err), r.pos_err + 0.1 * r.rot_err))
+        if not within_pose_tol(end.pos_err, end.rot_err):
+            raise Unreachable(f"{self.name}: that pose is out of reach (the closest reachable pose is "
+                              f"{end.pos_err * 1000:.0f} mm and {math.degrees(end.rot_err):.1f} deg off). "
+                              "Choose a closer point or another pitch.")
+        return end
+
+    def solve_pose(self, q0, goal) -> np.ndarray:
+        """Joints that put the tool at ``goal`` (4x4, world), solved from ``q0``; Unreachable when out of reach."""
+        q0 = np.asarray(q0, dtype=float)
+        return np.asarray(self._solve(q0, self.base_from_world @ np.asarray(goal, dtype=float)).q, dtype=float)
 
     def plan_tool_path(self, q0, goal, speed_rad_s: float, rate_hz: float) -> np.ndarray:
         """(T, 6) joints moving the tool point in a straight line to ``goal`` (4x4, world), minimum jerk, solved
@@ -257,17 +291,13 @@ class ArmModel:
         target = self.base_from_world @ np.asarray(goal, dtype=float)
         ik = self.ik
         lo, hi = ik.bounds(q0)
-        end = min((self.chain.ik(target, np.clip(seed, lo, hi), limits=(lo, hi)) for seed in (q0, self.home_q)),
-                  key=lambda r: (not within_pose_tol(r.pos_err, r.rot_err), r.pos_err + 0.1 * r.rot_err))
-        if not within_pose_tol(end.pos_err, end.rot_err):
-            raise Unreachable(f"{self.name}: that pose is out of reach (the closest reachable pose is "
-                              f"{end.pos_err * 1000:.0f} mm and {math.degrees(end.rot_err):.1f} deg off). "
-                              "Choose a closer point or another pitch.")
+        end = self._solve(q0, target)
         start = self.chain.fk(q0)
         speeds = np.minimum(ik.max_velocity, speed_rad_s)
         seconds = max(MIN_SECONDS, 1.25 * float(np.max(1.875 * np.abs(np.asarray(end.q) - q0) / speeds)))
         # The IK is solved at a coarse rate (PLAN_STEP per tick at most) and interpolated to rate_hz.
         plan_hz = min(rate_hz, speed_rad_s / PLAN_STEP)
+        limit_ticks(self.name, seconds * rate_hz, rate_hz)
         ticks = int(math.ceil(seconds * plan_hz))
         for _ in range(6):
             # A path the speed cap shortens is retimed slower.
@@ -277,6 +307,7 @@ class ArmModel:
             if not plan.capped.any():
                 break
             ticks = int(math.ceil(ticks * 1.5))
+            limit_ticks(self.name, ticks * rate_hz / plan_hz, rate_hz)
         path = resample(q0, plan.q, plan_hz, rate_hz)
         # The tick solve leans towards the profile's rest pose and stops a little short of the goal.
         finish = self.chain.ik(target, np.clip(path[-1], lo, hi), limits=(lo, hi))
@@ -287,3 +318,10 @@ class ArmModel:
             raise Unreachable(f"{self.name}: the straight path to that pose ends {position * 1000:.0f} mm and "
                               f"{math.degrees(angle):.1f} deg off it. Try an intermediate point.")
         return path
+
+
+def limit_ticks(name: str, ticks: float, rate_hz: float) -> None:
+    """Unreachable when a plan would need more than MAX_SECONDS of waypoints."""
+    if not ticks <= MAX_SECONDS * rate_hz:
+        raise Unreachable(f"{name}: that motion would take more than {MAX_SECONDS:g} s (the longest planned move) at "
+                          "this speed. Move faster or split it.")
