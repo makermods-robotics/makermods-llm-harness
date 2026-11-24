@@ -13,8 +13,11 @@ import pytest
 from makermods_llm_harness import agent, tools
 from makermods_llm_harness.agent import AnthropicProvider, Reply, ToolCall
 from makermods_llm_harness.kernel import TOOL
+from makermods_llm_harness.session import FAMILY
 
 from conftest import APPROACH, GRASP_PITCH, GRASP_Z, sim_backend
+
+needs_kernel = pytest.mark.skipif(FAMILY == "AF_PIPE", reason="the kernel is not available on Windows")
 
 
 def act(*actions):
@@ -226,6 +229,7 @@ def test_anthropic_refusal_and_missing_key(mock_api, monkeypatch, tmp_path):
     assert len(sent) == 1
 
 
+@needs_kernel
 def test_the_model_queues_actions_in_the_kernel_and_gets_their_reports(served):
     server, client = served()
     h = server.harness
@@ -243,6 +247,7 @@ def test_the_model_queues_actions_in_the_kernel_and_gets_their_reports(served):
     assert h.state().arms["arm"].tool.xyz[2] == pytest.approx(0.531, abs=2e-3)
 
 
+@needs_kernel
 def test_a_run_that_ends_abnormally_stops_what_it_queued(served, tmp_path):
     server, client = served()
     gate = tmp_path / "never"
@@ -264,6 +269,7 @@ def test_a_run_that_ends_abnormally_stops_what_it_queued(served, tmp_path):
     assert status["waiting"] == [] and [(r["name"], r["status"]) for r in reports] == [("waits", "stopped")]
 
 
+@needs_kernel
 def test_a_stopped_kernel_call_skips_the_rest_of_its_batch(served):
     server, client = served()
     provider = Scripted(Reply(tool_calls=[ToolCall("py-1", "run_python", {"code": "kernel.stop()"}),
@@ -274,6 +280,7 @@ def test_a_stopped_kernel_call_skips_the_rest_of_its_batch(served):
     assert skipped.startswith("not run: ") and not server.harness.state().arms["arm"].enabled
 
 
+@needs_kernel
 def test_a_motion_that_did_not_end_done_in_a_call_skips_the_rest_of_its_batch(served):
     server, client = served()
     client.step({"action": "home"})
@@ -287,6 +294,7 @@ def test_a_motion_that_did_not_end_done_in_a_call_skips_the_rest_of_its_batch(se
     assert server.harness.state().arms["arm"].gripper < 0.05
 
 
+@needs_kernel
 def test_cleanup_stops_only_the_runs_own_work_and_reports_a_failure(served, tmp_path, monkeypatch):
     server, client = served()
     gate = tmp_path / "never"
@@ -326,6 +334,7 @@ def test_reply_images_reads_only_files_in_the_run_image_dir_within_the_size_limi
                                 "image_digests": {big: hashlib.sha256(Path(big).read_bytes()).hexdigest()}}, 1) == []
 
 
+@needs_kernel
 def test_a_motion_fault_in_python_ends_the_run_as_a_fault(served, monkeypatch):
     server, client = served()
     client.step({"action": "home"})
@@ -342,6 +351,7 @@ def test_a_motion_fault_in_python_ends_the_run_as_a_fault(served, monkeypatch):
     assert server.harness.state().arms["arm"].gripper < 0.05
 
 
+@needs_kernel
 def test_a_fault_seen_only_in_the_final_poll_ends_the_run_as_a_fault(served):
     server, client = served()
     client.step({"action": "home"})

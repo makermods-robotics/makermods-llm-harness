@@ -172,6 +172,7 @@ def test_malformed_requests_and_harness_errors_get_error_replies(serving, monkey
 
 def test_server_dying_mid_request_is_a_session_error(address):
     from makermods_llm_harness.session import CHALLENGE, key_path
+    key_path(address).parent.mkdir(parents=True, exist_ok=True)
     key_path(address).write_bytes(b"k" * 32)
     listener = Listener(address, family=FAMILY)
 
