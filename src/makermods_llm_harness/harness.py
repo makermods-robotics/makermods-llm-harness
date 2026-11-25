@@ -523,6 +523,7 @@ class Harness:
         env.require_table()
         state = self._usable(name)
         if isinstance(act, Gripper):
+            self._gripper_check(name, state, act.opening)
             return self._gripper(name, self._ready(name, state), act.opening)
         if not state.enabled:
             # Planned and checked first (from where enabling leaves it), so a refused request never turns it on.
@@ -589,6 +590,7 @@ class Harness:
         if not state.enabled:
             self._enable_ramp(name, state)
         if isinstance(act, Gripper):
+            self._gripper_check(name, state, act.opening)
             return Result(message="dry run: it would pass the checks; nothing moved.")
         q0, commanded = self._check_start(name, state)
         path, _, _ = self._checked_path(name, act, q0, commanded)
@@ -722,6 +724,15 @@ class Harness:
             raise MoveRejected(f"{name}: a motor is at {state.temperature:.0f} C, over the "
                                f"{self.config.max_temp_c:.0f} C limit. Wait for it to cool, then try again.")
         return state
+
+    def _gripper_check(self, name: str, state: ArmState, opening: float) -> None:
+        """Refuse opening jaws that cannot open at the rest pose while the arm stands there."""
+        model = self.models[name]
+        if model.gripper.opens_at_rest or state.rest_q is None or opening <= state.gripper + GRIP_STILL:
+            return
+        if float(np.max(np.abs(state.q - state.rest_q))) <= math.radians(REST_TOLERANCE_DEG):
+            raise MoveRejected(f"{name}: the jaws cannot open at the rest pose: they meet the arm there. Move it out "
+                               "first (home), then open them.")
 
     def _can_enable(self, name: str, state: ArmState) -> None:
         """Refuse to turn on an arm that is not at its recorded rest pose."""

@@ -130,6 +130,7 @@ kernel.queue([grasp, lift])
   arm stands still short of the target once the command has ended. Use it instead of stepping down a centimetre at
   a time. A plain move that ends more than 10 mm short of its target along the approach raises `MotionFailed`
   (stopped); `result.error["short_m"]` says by how much.
+- A Maker arm's jaws cannot open at its rest pose (they meet the arm): `r.home()` first.
 - `r.gripper(...)` returns `grip` with `opening` (measured), `target` and `holding` (the jaws closed and then
   stalled on something). A close that stalls without closing far enough to tell, or an opening that does not open,
   raises `MotionFailed` (stopped): look before going on.

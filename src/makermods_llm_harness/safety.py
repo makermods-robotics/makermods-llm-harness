@@ -194,7 +194,8 @@ class SafetyConfig:
         base = GRIPPERS[arm_type]
         pick = lambda value, default: default if value is None else float(value)  # noqa: E731
         return Gripper(pick(self.finger_length_m, base.finger_length_m),
-                       pick(self.jaw_half_width_m, base.jaw_half_width_m), pick(self.finger_margin_m, base.margin_m))
+                       pick(self.jaw_half_width_m, base.jaw_half_width_m), pick(self.finger_margin_m, base.margin_m),
+                       base.opens_at_rest)
 
     @classmethod
     def from_dict(cls, raw: Optional[dict]) -> "SafetyConfig":

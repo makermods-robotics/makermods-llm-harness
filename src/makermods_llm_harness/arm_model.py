@@ -32,17 +32,20 @@ VERTICAL = math.sin(math.radians(0.5))   # |cos pitch| below this counts as poin
 class Gripper:
     """Fingertip geometry in the tool frame. ``finger_length_m``: how far the fingertips reach past the tool point
     along the pointing direction; ``jaw_half_width_m``: how far the open jaws reach from the tool axis along tool x
-    (the closing direction); ``margin_m`` is added to both for the envelope's monitored points."""
+    (the closing direction); ``margin_m`` is added to both for the envelope's monitored points. ``opens_at_rest``:
+    whether the jaws can open with the arm folded at its rest pose."""
     finger_length_m: float
     jaw_half_width_m: float
     margin_m: float
+    opens_at_rest: bool = True
 
 
 GRIPPERS = {
     # The SDK URDF's gripper_left/right collision meshes in the tool frame: closed or open, the jaws reach 34.2 mm
     # past the tool point; open (prismatic limit 52.4 mm per jaw), they reach 72.5 mm from the tool axis ahead of
     # the tool point.
-    "maker": Gripper(0.0342, 0.0725, 0.003),
+    # Folded at rest, the open jaws meet the arm's own body: they stop at about a tenth open.
+    "maker": Gripper(0.0342, 0.0725, 0.003, opens_at_rest=False),
     # The SDK URDF lumps the gripper into its last link without a mesh, so these are the MuJoCo model's fingers
     # (tips 15 mm past the tool point, open outer faces 50 mm from the axis) with a 10 mm margin.
     "metal": Gripper(0.015, 0.050, 0.010),

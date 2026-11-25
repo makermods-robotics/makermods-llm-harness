@@ -396,3 +396,16 @@ def test_a_full_disk_is_reported_in_the_reply(sim_harness, tmp_path, monkeypatch
     assert obs.result.status == "rejected" and "nothing moved" in obs.result.message
     assert not obs.arms["arm"].enabled
     monkeypatch.undo()
+
+
+def test_maker_jaws_do_not_open_at_the_rest_pose(sim_harness):
+    h = sim_harness(arm="maker")
+    obs = h.step({"action": "gripper", "opening": 1.0})
+    assert obs.result.status == "rejected" and "cannot open at the rest pose" in obs.result.message
+    assert not h.backend.read()["arm"].enabled                              # refused before the motors came on
+    assert h.check({"action": "gripper", "opening": 1.0}).status == "rejected"
+    assert_done(h.step({"action": "gripper", "opening": 0.0}))              # closing is fine
+    assert_done(h.step({"action": "home"}))
+    assert_done(h.step({"action": "gripper", "opening": 1.0}))
+    metal = sim_harness(arm="metal")
+    assert_done(metal.step({"action": "gripper", "opening": 1.0}))          # its jaws open at rest

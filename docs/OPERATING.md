@@ -183,6 +183,7 @@ Common rejections:
 | `would bring the ... into keep-out zone NAME ... Go around it` | the path crosses a zone (`op describe` gives its corners): move away from it first, then approach the target from another side |
 | `inside keep-out zone NAME ... only motions that keep moving out of the zone` | the arm is already in the zone: move straight away from it first |
 | `under the 0 mm hard floor once tracking error and sag are allowed for ... only motions that keep gaining height` | the arm is already too low: lift first, `op nudge 0 0 0.02` |
+| `the jaws cannot open at the rest pose` | a Maker arm folded at rest: `home` first, then open |
 | `the motors turn on only at the rest pose` | the arm was moved while off: the operator folds it back to rest |
 | `no rest pose is recorded` | the operator runs `llm-harness calibrate --rest` |
 | `name the arm: left or right` | add `--arm left` or `--arm right` |
