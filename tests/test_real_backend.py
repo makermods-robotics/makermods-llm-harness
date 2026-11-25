@@ -544,3 +544,85 @@ def test_an_enable_the_sdk_refuses_for_a_held_arm_names_attach(rig, monkeypatch)
     obs = h.step({"action": "home"})
     assert obs.result.status == "fault" and "another program holds this arm" in obs.result.message
     assert "llm-harness serve --attach" in obs.result.message and f"{kind}-arm rest --arm arm" in obs.result.message
+
+
+FAKE_CAMERAS = '''
+import time
+import numpy as np
+from maker_arm.cameras import Frame
+
+class Camera:
+    def __init__(self, id):
+        self.id = id
+
+    def open(self):
+        if self.id == "broken":
+            raise OSError("no such camera")
+
+    def newest(self, max_age_s=None):
+        if self.id == "old" and max_age_s is not None:
+            return None
+        return Frame(np.full((4, 6, 3), 7, np.uint8), time.time(), time.monotonic())
+
+    def close(self):
+        pass
+'''
+
+
+def test_cameras_built_from_ids_run_in_a_helper_process(tmp_path, monkeypatch):
+    from makermods_llm_harness.backends.camera_process import CameraProcess
+    (tmp_path / "fake_cameras.py").write_text(FAKE_CAMERAS)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    camera = CameraProcess("fake_cameras", "front")
+    camera.open()
+    try:
+        pid = camera._proc.pid
+        assert pid != __import__("os").getpid()
+        frame = camera.newest(1.0)
+        assert frame[0].shape == (4, 6, 3) and int(frame[0][0, 0, 0]) == 7 and frame.captured is not None
+    finally:
+        camera.close()
+    assert camera.newest(1.0) is None                                     # closed: no frame, no error
+    old = CameraProcess("fake_cameras", "old")
+    old.open()
+    assert old.newest(1.0) is None
+    old.close()
+    with pytest.raises(OSError, match="did not open: no such camera"):
+        CameraProcess("fake_cameras", "broken").open()
+
+
+def test_a_backend_from_camera_ids_uses_helper_processes(monkeypatch):
+    built = []
+
+    class Recorder:
+        def __init__(self, module, cid):
+            built.append((module, cid))
+
+        def open(self):
+            pass
+
+        def newest(self, max_age_s=None):
+            return None
+
+        def close(self):
+            pass
+    monkeypatch.setattr("makermods_llm_harness.backends.real.CameraProcess", Recorder)
+    arm, sim = importlib.import_module("maker_arm.testing").simulated_arm()
+    backend = RealBackend("maker", {}, {"front": "url:http://127.0.0.1:1/front"}, [ArmInfo("arm", "maker")],
+                          arms={"arm": arm})
+    backend.close()
+    assert built == [("maker_arm.cameras", "url:http://127.0.0.1:1/front")]
+
+
+def test_the_camera_helper_takes_the_slowest_cpus_only_when_they_differ(tmp_path, monkeypatch):
+    from makermods_llm_harness.backends.camera_process import slow_cpus
+    monkeypatch.setattr("os.cpu_count", lambda: 4)
+    for cpu, capacity in enumerate((446, 446, 1024, 1024)):
+        (tmp_path / f"cpu{cpu}").mkdir()
+        (tmp_path / f"cpu{cpu}" / "cpu_capacity").write_text(f"{capacity}\n")
+    assert slow_cpus(str(tmp_path)) == {0, 1}
+    for cpu in range(4):
+        (tmp_path / f"cpu{cpu}" / "cpu_capacity").write_text("1024\n")
+    assert slow_cpus(str(tmp_path)) is None
+    assert slow_cpus(str(tmp_path / "missing")) is None

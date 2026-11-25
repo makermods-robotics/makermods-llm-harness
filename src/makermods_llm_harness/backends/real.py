@@ -1,8 +1,8 @@
 """Real arms and cameras through the arm SDK (``metal_arm`` or ``maker_arm``).
 
-Opening the backend connects every arm (motors found, torque left as it is) and opens the cameras; an arm
-gets torque only from ``enable``, or with ``attach`` an arm found holding with torque on (left by an earlier
-session) is taken over where it holds. A camera that fails to open is left out and its error kept in
+Opening the backend connects every arm (motors found, torque left as it is) and opens the cameras, each in a helper
+process (``camera_process``); an arm gets torque only from ``enable``, or with ``attach`` an arm found holding with
+torque on (left by an earlier session) is taken over where it holds. A camera that fails to open is left out and its error kept in
 ``camera_errors``; the arms stay usable.
 """
 
@@ -18,6 +18,7 @@ from typing import Mapping, Optional
 import numpy as np
 
 from .base import ArmInfo, ArmState, ArmTarget, Backend, Frame
+from .camera_process import CameraProcess
 
 log = logging.getLogger(__name__)
 ENABLE_SPEED = math.radians(5.0)   # rad/s until the first target: a joint resting past a limit comes inside slowly
@@ -49,8 +50,7 @@ class RealBackend(Backend):
         if missing:
             raise ValueError(f"no arm given for {', '.join(missing)}")
         if cameras is None:
-            camera_module = importlib.import_module(f"{arm_type}_arm.cameras")
-            cameras = {name: camera_module.Camera(cid) for name, cid in camera_ids.items()}
+            cameras = {name: CameraProcess(f"{arm_type}_arm.cameras", cid) for name, cid in camera_ids.items()}
         self.group = rig.ArmGroup({name: arms[name] for name in names}, parallel=parallel)
         self.rest_q = {name: np.array(q, float) for name, q in (rest_q or {}).items()}
         self.camera_max_age_s = camera_max_age_s
