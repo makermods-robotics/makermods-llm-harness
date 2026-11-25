@@ -57,6 +57,10 @@ class Table:
             raise ValueError("no table points")
         return cls(rows[0][1]) if len(rows) == 1 else cls(float(np.mean([h for _, h in rows])), tuple(rows))
 
+    def shifted(self, dz: float) -> "Table":
+        """This table moved up by ``dz`` (down when negative) at every reach."""
+        return Table(self.z + dz, tuple((r, h + dz) for r, h in self.reach))
+
     def at(self, points: np.ndarray, base_xy) -> np.ndarray:
         """The table height under each of ``points`` (..., 3), world frame, for an arm based at ``base_xy``: linear
         between the measured reaches; outside them, the higher of the highest measured height plus OUTSIDE_MARGIN_M

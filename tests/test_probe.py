@@ -205,3 +205,39 @@ def test_a_blocked_fingertip_is_never_commanded_far_under_where_it_stands(bench,
     assert lowest == pytest.approx(table_at(math.hypot(*POINTS[0])), abs=0.003)
     assert min(targets) >= lowest - probe.BELOW_CONTACT_M - 1e-6
     assert min(targets) > 0.05 - probe.BELOW_M + 0.01                 # far above the limit it used to reach
+
+
+@pytest.mark.parametrize("stored", ["none", "other setup"])
+def test_without_expect_the_powered_calibration_needs_a_table_stored_for_the_present_setup(bench, stored):
+    from makermods_llm_harness.safety import Table, save_calibration
+    backend, made = bench
+    robot = robots.load("bench")
+    if stored == "other setup":
+        setup = robot.setup("left")
+        setup["base_xyz"] = [0.0, 0.0, 0.03]                       # the arm base was moved since
+        save_calibration("bench", "left", Table(0.05), setup)
+    before = load_calibration("bench")
+    with pytest.raises(CalibrationError, match="give --expect Z"):
+        cli.calibrate_powered(robot, ["left"], points=POINTS[:1], yes=True, say=lambda s: None)
+    assert not made and load_calibration("bench") == before            # nothing opened, nothing stored
+
+
+def test_a_stored_table_per_reach_sets_the_expectation_and_limit_at_each_points_own_reach(bench, monkeypatch):
+    from makermods_llm_harness.safety import Table, save_calibration
+    robot = robots.load("bench")
+    stored = Table(0.058, ((0.25, 0.048), (0.40, 0.068)))              # mean 0.058; 2 cm higher out at 0.40 m
+    save_calibration("bench", "left", stored, robot.setup("left"))
+    real, seen = probe._probe_point, []
+
+    def probe_point(harness, arm, x, y, expect_z, limit_z, say):
+        floor = harness.envelopes[arm].table_under([x, y, 0.0])
+        seen.append((math.hypot(x, y), expect_z, limit_z, floor))
+        return real(harness, arm, x, y, expect_z, limit_z, say)
+    monkeypatch.setattr(probe, "_probe_point", probe_point)
+    cli.calibrate_powered(robot, ["left"], points=[POINTS[0], POINTS[2]], yes=True, say=lambda s: None)
+    assert len(seen) == 2
+    for reach, expect_z, limit_z, floor in seen:
+        want = float(stored.at(np.array([[reach, 0.0, 0.0]]), (0.0, 0.0))[0])
+        assert expect_z == pytest.approx(want) and limit_z == pytest.approx(want - probe.BELOW_M)
+        assert floor == pytest.approx(limit_z)
+    assert seen[1][2] > stored.z - probe.BELOW_M + 0.01                 # far out: well above the mean's limit

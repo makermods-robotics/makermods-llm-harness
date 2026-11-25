@@ -10,8 +10,8 @@ short of its target (``ended_short``) is a reading like any other: the arm holds
 is absolute. Any other stop or fault ends the probe, as does falling more than PRESS_M behind without standing
 still. Lag closes once a command has ended, so it never passes; a support does not. The table there is the
 measured fingertip height. No target ever lies more than BELOW_CONTACT_M under the lowest fingertip height measured
-at that point, nor under ``limit_z``, and the harness it runs on has its table at ``limit_z``, so its own floor
-refuses anything lower. The arm starts at rest with its motors cool and is rested at the end, also after a failure.
+at that point, nor more than BELOW_M under the expected table at the point's own reach, and the harness it runs on
+has its table there, so its own floor refuses anything lower. The arm starts at rest with its motors cool and is rested at the end, also after a failure.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import numpy as np
 
 from .arm_model import Unreachable
 from .harness import Harness
-from .safety import REST_TOLERANCE_DEG, CalibrationError
+from .safety import REST_TOLERANCE_DEG, CalibrationError, Table
 
 STEP_M = 0.002               # fingertip target step
 ABOVE_M = 0.06               # the descent starts this far above the expected table
@@ -50,15 +50,24 @@ def default_points(harness: Harness, arm: str, reaches: Sequence[float] = DEFAUL
     return [tuple(float(v) for v in base + r * heading) for r in reaches]
 
 
-def probe_table(harness: Harness, arm: str, points: Sequence[tuple], expect_z: float, limit_z: float,
+def probe_table(harness: Harness, arm: str, points: Sequence[tuple], expect: Table,
                 say: Callable[[str], None] = print) -> list[tuple[float, float, list]]:
     """Find the table under ``arm`` at each world (x, y) of ``points``: ``[(reach_m, z_m, fingertip_xyz), ...]``.
-    ``expect_z``: roughly where the table is (world z); ``limit_z``: the lowest the fingertips are ever sent. The
-    harness's table height for the arm must be ``limit_z``. CalibrationError when the arm is not ready, a point
-    has no pose, or no table is found before ``limit_z``; the arm rests in every case."""
+    ``expect``: roughly where the table is (world z, at each point's own reach); the fingertips are never sent
+    lower than BELOW_M under it, and the harness's table for the arm must stand there (``expect`` moved down by
+    BELOW_M). CalibrationError when the arm is not ready, a point has no pose, or no table is found down there;
+    the arm rests in every case."""
     model = harness.models[arm]
-    if harness.envelopes[arm].table_z is None or abs(harness.envelopes[arm].table_z - limit_z) > 1e-9:
-        raise CalibrationError(f"{arm}: the harness's table must stand at the probe limit z = {limit_z:.3f} m")
+    env = harness.envelopes[arm]
+    base = model.world_from_base[:2, 3]
+    heights = []
+    for x, y in points:
+        where = np.array([[float(x), float(y), 0.0]])
+        expect_z = float(expect.at(where, base)[0])
+        if env.table is None or abs(float(env.table.at(where, base)[0]) - (expect_z - BELOW_M)) > 1e-9:
+            raise CalibrationError(f"{arm}: the harness's table must stand {BELOW_M * 100:.0f} cm under the expected "
+                                   f"table at ({float(x):.3f}, {float(y):.3f})")
+        heights.append(expect_z)
     state = harness.backend.read()[arm]
     if state.fault:
         raise CalibrationError(f"{arm}: {state.fault}")
@@ -72,8 +81,8 @@ def probe_table(harness: Harness, arm: str, points: Sequence[tuple], expect_z: f
     try:
         _expect_done(harness.step({"action": "home", "arm": arm}), "home")
         _expect_done(harness.step({"action": "gripper", "opening": 0.0, "arm": arm}), "close the jaws")
-        for x, y in points:
-            found.append(_probe_point(harness, arm, float(x), float(y), expect_z, limit_z, say))
+        for (x, y), expect_z in zip(points, heights):
+            found.append(_probe_point(harness, arm, float(x), float(y), expect_z, expect_z - BELOW_M, say))
     finally:
         rested = harness.step({"action": "rest", "arm": arm}).result
         if not rested.ok:
