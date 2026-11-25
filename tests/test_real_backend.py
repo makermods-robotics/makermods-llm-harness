@@ -518,9 +518,9 @@ def test_an_old_firmware_arm_carrying_load_is_held_by_another_program_and_attach
     h = Harness.open(backend=plain, table_z=-0.5)
     obs = h.step({"action": "home"})
     assert obs.result.status == "fault" and "--attach" in obs.result.message        # nothing sent to it
-    held = np.array(sim.positions[:6])
     h.close()
     arm, sim, model, rest = held_by_a_dead_program()
+    held = np.array(sim.positions[:6])
     backend = RealBackend("maker", {}, {}, [ArmInfo("arm", "maker")], arms={"arm": arm}, rest_q={"arm": rest},
                           attach=True)
     state = backend.read()["arm"]
