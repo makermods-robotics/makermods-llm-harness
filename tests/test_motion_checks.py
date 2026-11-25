@@ -438,3 +438,15 @@ def test_a_contact_move_may_aim_a_bounded_depth_under_a_correctly_stored_table(s
     assert deep.status == "rejected" and "floor of a move with until contact" in deep.message
     assert h.state().arms["arm"].clearance_m == pytest.approx(0.0, abs=0.003)     # it stopped on the table
     assert SafetyConfig().contact_depth_m == 0.025
+
+
+def test_a_second_contact_descent_goes_no_deeper_than_the_first_was_held(sim_harness):
+    h = sim_harness()                                      # no surface: the arm would sink through the table
+    r = over_the_surface(h)
+    clearance = h.state().arms["arm"].clearance_m
+    first = r.nudge([0, 0, -(clearance + 0.020)], until="contact")
+    held_at = h.state().arms["arm"].clearance_m
+    assert first.status == "stopped" and held_at == pytest.approx(-0.010, abs=0.002)   # the watch: 10 mm under
+    second = r.nudge([0, 0, -0.010], until="contact")
+    assert second.status != "done"
+    assert h.state().arms["arm"].clearance_m >= held_at - 0.001

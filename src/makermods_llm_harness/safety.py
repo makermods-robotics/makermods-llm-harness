@@ -281,10 +281,12 @@ class Envelope:
         return float(lowest) if np.ndim(lowest) == 0 else lowest
 
     def hold_floor(self, q_start) -> float:
-        """The measured clearance under which a motion from ``q_start`` is held: the hard floor, or for an arm
-        starting below it, its start less the sag allowance; either less the contact allowance."""
+        """The measured clearance under which a motion from ``q_start`` is held: the hard floor less the contact
+        allowance, anchored there; for an arm starting below that, its start less the sag allowance and
+        RECOVERY_EPS_M (it may only move back up)."""
         cfg = self.config
-        return min(cfg.floor_margin_m, float(self.clearance(q_start)) - cfg.sag_allowance_m) - cfg.contact_allowance_m
+        return min(cfg.floor_margin_m - cfg.contact_allowance_m,
+                   float(self.clearance(q_start)) - cfg.sag_allowance_m - RECOVERY_EPS_M)
 
     def zone_distances(self, q) -> tuple[np.ndarray, np.ndarray]:
         """Per zone, the signed distance of the arm's closest sampled point (negative inside) and that point's
