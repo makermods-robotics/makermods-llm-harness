@@ -126,8 +126,10 @@ kernel.queue([grasp, lift])
 - A motion that does not end done raises `MotionFailed` (its `.result` says why), which ends the action with an
   error and drops what waits behind it. A check at the top of an action (`raise`) stops it before it moves.
 - `until="contact"` ends a move or nudge early, holding, where the measured arm stops following its command; the
-  result says so (`result.contact["xyz"]`, `result.contact["short_m"]`). Use it instead of stepping down a
-  centimetre at a time.
+  result says so (`result.contact["xyz"]`, `result.contact["short_m"]`). It also ends there, as contact, when the
+  arm stands still short of the target once the command has ended. Use it instead of stepping down a centimetre at
+  a time. A plain move that ends more than 10 mm short of its target along the approach raises `MotionFailed`
+  (stopped); `result.error["short_m"]` says by how much.
 - `r.gripper(...)` returns `grip` with `opening` (measured), `target` and `holding` (the jaws closed and then
   stalled on something). A close that stalls without closing far enough to tell, or an opening that does not open,
   raises `MotionFailed` (stopped): look before going on.

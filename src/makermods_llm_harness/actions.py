@@ -326,7 +326,8 @@ class Result:
     """How the last action ended. ``status`` is "done", "rejected" (refused before anything moved: fix the
     request and try again), "stopped" (ended early, the arm holds where it is) or "fault" (the arm reports
     a fault). ``message`` explains anything but "done" in plain words. ``error``: after a tool move, how far the
-    measured tool pose ended from the requested one, ``{"position_m", "angle_deg"}``. ``contact``: a move with
+    measured tool pose ended from the requested one, ``{"position_m", "angle_deg", "short_m"}`` (``short_m``: how far
+    short of the target along the approach, negative past it). ``contact``: a move with
     until "contact" that ended on contact, ``{"xyz", "short_m"}`` (where the tool point stopped, how far short of
     the target). ``grip``: after a gripper action, ``{"opening", "target", "holding"}`` (the measured and the
     requested opening, and whether the jaws stopped on something)."""

@@ -68,9 +68,11 @@ command (a joint moved at least 1 deg and half as far as its command) and then, 
 its tool point advanced along the approach less than a quarter as far as the command had one tracking lag earlier,
 for more than 0.3 s, and fell more than `contact_tolerance_m` beyond both the offset it stood at before the move and
 the largest shortfall it had while advancing freely (load changes, lag), from every tool point commanded within the
-lag; `result.contact` says where. Lag, gear take-up, a standing error, a shortfall seen only once the command has
-stopped, or a miss in orientation only, are never contact: such a move ends `done` if the measured tool pose
-arrived, else `stopped`. A move whose target is under the floor is refused with how far down the lowest point may come from here. `speed_deg_s` (a joint speed cap, at least 0.5 deg/s, sent to the arm with every target) or
+lag; `result.contact` says where. A move that reaches the end of its command more than `contact_tolerance_m` short of
+the target along the approach, and then stands still for 0.3 s, also ends on contact there ("stopped on contact at the
+end of the move"); short and still moving, it is `stopped`. Lag, gear take-up, a standing error within the tolerance,
+or a miss in orientation only, are never contact: such a move ends `done` if the measured tool pose arrived, else
+`stopped`. A move whose target is under the floor is refused with how far down the lowest point may come from here. `speed_deg_s` (a joint speed cap, at least 0.5 deg/s, sent to the arm with every target) or
 `duration_s` (at most 60 s; a shorter move is stretched to it) slows `move_tool`, `nudge`, `move_joints` and `home`;
 nothing goes faster than the envelope, and no plan lasts more than 120 s. The motion ops (`move_tool`, `nudge`,
 `gripper`, `move_joints`, `home`, `rest`) take `--dry-run`: checked as they would be, nothing moves; so do the
@@ -86,7 +88,7 @@ llm-harness op nudge 0 0 -0.08 --until contact
 |---|---|
 | `step`, `time` | actions so far in this run; Unix time |
 | `result.status`, `result.message`, `result.action` | how the action ended, why, and the action as parsed |
-| `result.error` | after a tool move: `position_m` and `angle_deg` between the measured and the requested tool pose |
+| `result.error` | after a tool move: `position_m` and `angle_deg` between the measured and the requested tool pose, and `short_m`, how far the tool point ended short of the target along the approach (negative past it) |
 | `result.contact` | after a move with `until: "contact"` that stopped on contact: `xyz` of the tool point and `short_m` from the target |
 | `result.grip` | after `gripper`: `opening` (measured), `target`, `settled`, `holding`. Done, not holding, within 0.02 of the request, or settled (less than 0.005 over 0.5 s) within 0.04 of it (0.15 when opening: jaws stop at their mechanical end). Holding when, closing, the jaws stalled (less than 0.003 over 1 s) more than 0.06 short of the request after closing at least 0.05, or were already closed on something. Anything else by the 2.5 s limit (still moving or creeping, stalled without that progress, an opening that does not open): `stopped` (undetermined or blocked), the gripper held where it is |
 | `arms.<arm>.tool` | `xyz` (m) and `pitch_deg`, `yaw_deg`, `roll_deg`: the same angles `move_tool` takes |
@@ -120,7 +122,7 @@ tick by tick while it runs. The numbers are the `SafetyConfig` defaults; a robot
 | Hard floor: the elbow and wrist joints, the tool point, the fingertips and the tips of the fully open jaws stay this far above the table at every waypoint, with every joint off its plan by the floor tolerance (a worst case through the kinematics) and the whole arm lower by the sag allowance. By default they may come down to the table surface: the arm may touch the table | 0 mm, 0 deg, 0 mm (`floor_margin_m`, `floor_tolerance_deg`, `sag_allowance_m`) |
 | Recovery: an arm already under the floor may only gain height, and once above it the floor holds again | |
 | Keep-out zones: boxes in the world frame (robot file `keep_out:`). No point along an arm, sampled every 10 mm on the links from its base to the tool point, the fingers and the open jaws, comes within the margin of a box at any waypoint. An arm already inside may only move further out; the way down to a rest pose may end inside when the rest pose lies there. A measured point entering a box holds the arm | 30 mm (`keep_out_margin_m`) |
-| Tool targets: a tool move is refused when the closest pose its path can reach is further than this from the request, and is `done` when the measured tool pose ends within the arrival tolerance, or within the sag tolerance when the standing error the joints held before the move explains the miss (the message then says how far off it ended) | 5 mm, 2 deg (`POSE_TOL_M`, `POSE_TOL_DEG`); 10 mm, 3 deg (`ARRIVAL_TOL_M`, `ARRIVAL_TOL_DEG`); 30 mm, 6 deg (`SAG_ARRIVAL_TOL_M`, `SAG_ARRIVAL_TOL_DEG`) |
+| Tool targets: a tool move is refused when the closest pose its path can reach is further than this from the request, and is `done` when the measured tool pose ends within the arrival tolerance, or within the sag tolerance when the standing error the joints held before the move explains the miss (the message then says how far off it ended), unless it ended more than the contact tolerance short of the target along the approach: that is `stopped`, with the shortfall | 5 mm, 2 deg (`POSE_TOL_M`, `POSE_TOL_DEG`); 10 mm, 3 deg (`ARRIVAL_TOL_M`, `ARRIVAL_TOL_DEG`); 30 mm, 6 deg (`SAG_ARRIVAL_TOL_M`, `SAG_ARRIVAL_TOL_DEG`) |
 | Rest: the way down to the recorded rest pose may end under the floor when the rest pose lies there, if no point on it is lower than the rest pose and it runs at the slow speed | |
 | Watch: a joint farther than the tracking tolerance from every waypoint sent within the tracking lag (elapsed time, every tick at least 1/`rate_hz`, at most 0.5 s: the allowance along the path grows with the commanded speed), a measured monitored point more than the contact allowance under the floor, a fault on any arm or a motor over the temperature limit holds the arm where it is | 6 deg, 0.2 s, 10 mm (`tracking_tolerance_deg`, `tracking_lag_s`, `contact_allowance_m`) |
 | Settling: after the last waypoint the goal is sent again until the joints are within 1 deg of it, for at most | 1 s (`settle_s`) |

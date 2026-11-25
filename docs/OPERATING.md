@@ -169,7 +169,7 @@ misremembered height ends somewhere else.
 |---|---|---|
 | `done` | the action finished; the numbers are measured. A tool move is done only within 10 mm and 3 deg of its target; `--json` gives how far off it ended under `result.error`. | look, then decide |
 | `rejected` | refused before anything moved | read the message: it names the rule and usually the fix. Change the request; repeating it gets the same answer. |
-| `stopped` | ended early: `op stop`, a joint more than 6 deg off its path (blocked, maybe by a collision), a measured point more than 10 mm under the floor or inside a keep-out zone, a motor over the temperature limit, a motion that did not arrive, a tool move that `ended X mm and Y deg from the target` (up to 30 mm that the arm's sag explains is `done`, with the miss in the message), or a rest that ended without release. The arm holds where it is. | look at every camera before the next move. If it was blocked, find out by what. |
+| `stopped` | ended early: `op stop`, a joint more than 6 deg off its path (blocked, maybe by a collision), a measured point more than 10 mm under the floor or inside a keep-out zone, a motor over the temperature limit, a motion that did not arrive, a tool move that `ended X mm and Y deg from the target` (up to 30 mm that the arm's sag explains is `done`, with the miss in the message) or `ended N mm short of the target along the approach` (more than 10 mm: aim that much further, or use `--until contact`), or a rest that ended without release. The arm holds where it is. | look at every camera before the next move. If it was blocked, find out by what. |
 | `fault` | an arm reports a fault | stop sending actions and tell the operator what you did and saw |
 
 Common rejections:
