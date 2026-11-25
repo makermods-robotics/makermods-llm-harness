@@ -183,6 +183,8 @@ class Harness:
             if robot and robot.home:
                 for model in harness.models.values():
                     model.set_home(robot.home["xyz"], float(robot.home.get("pitch", 0.0)))
+            for name in getattr(backend, "attach_candidates", ()):
+                harness._take_over(name)
             return harness
         except BaseException:
             if opened:
@@ -1272,6 +1274,28 @@ class Harness:
         if state.rest_q is None:
             return Result("rejected", f"{name}: no rest pose is recorded, so the arm is not moved or released.")
         return None
+
+    def _take_over(self, name: str) -> None:
+        """Attach an arm found holding (``serve --attach``) only with a recorded rest pose, a table calibration and
+        a checked way from where it holds to rest; else the backend leaves it as it is and reports why."""
+        state = self.backend.read()[name]
+        env, model = self.envelopes[name], self.models[name]
+        why = None
+        if state.rest_q is None:
+            why = "no rest pose is recorded for it"
+        elif env.table is None:
+            why = "no table calibration matches its setup"
+        elif not np.all(np.isfinite(state.q)):
+            why = "its joints report no position"
+        else:
+            try:
+                self._rest_legs(env, model, state.q, state.rest_q)
+            except MoveRejected as e:
+                why = f"no checked way from where it holds to rest ({e})"
+        if why is None:
+            self.backend.attach(name)
+        else:
+            self.backend.refuse_attach(name, why)
 
     def _rest_legs(self, env: Envelope, model: ArmModel, q0: np.ndarray, goal: np.ndarray) -> list[np.ndarray]:
         """Checked joint paths from ``q0`` to the rest pose: one straight there, or two by way of home (the

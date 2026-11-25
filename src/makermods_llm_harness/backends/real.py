@@ -2,7 +2,8 @@
 
 Opening the backend connects every arm (motors found, torque left as it is) and opens the cameras, each in a helper
 process (``camera_process``); an arm gets torque only from ``enable``, or with ``attach`` an arm found holding with
-torque on (left by an earlier session) is taken over where it holds. A camera that fails to open is left out and its error kept in
+torque on (left by an earlier session) is listed in ``attach_candidates`` and taken over where it holds by
+``attach`` once the harness has checked its way to rest (``refuse_attach`` otherwise). A camera that fails to open is left out and its error kept in
 ``camera_errors``; the arms stay usable.
 """
 
@@ -69,8 +70,7 @@ class RealBackend(Backend):
         self._loaded: dict[str, list[str]] = {}   # arm off whose motors cannot report torque state but carry load
         self.ask_operator = None
         self.group.connect(clear_released=True)
-        if attach:
-            self._attach_energized()
+        self.attach_candidates: list[str] = self._energized() if attach else []
         for name, camera in cameras.items():
             try:
                 camera.open()
@@ -85,19 +85,29 @@ class RealBackend(Backend):
         rest = {name: np.radians(q) for name, q in (getattr(robot, "rest_q", None) or {}).items()}
         return cls(robot.arm, robot.arms, robot.cameras or {}, robot.arm_infos(), rest_q=rest, **kwargs)
 
-    def _attach_energized(self) -> None:
-        """Take over every arm whose motors report torque on, or that cannot report it but carry load, where it
-        holds."""
+    def _energized(self) -> list[str]:
+        """The arms whose motors report torque on, or that cannot report it but carry load."""
+        found = []
         for name, arm in self.group:
             arm.refresh()
             joints = arm.status()["joints"]
-            if not any(j["enabled"] for j in joints.values()) and not _loaded(joints):
-                continue
-            try:
-                arm.attach(speed=ENABLE_SPEED)
-            except Exception as e:
-                self._attach_errors[name] = f"could not be taken over ({e}); it holds as it was. {self.recovery(name)}"
-                log.error("%s: %s", name, self._attach_errors[name])
+            if any(j["enabled"] for j in joints.values()) or _loaded(joints):
+                found.append(name)
+        return found
+
+    def attach(self, arm: str) -> None:
+        """Take over an arm of ``attach_candidates`` where it holds (the harness has checked its way to rest)."""
+        try:
+            self.group[arm].attach(speed=ENABLE_SPEED)
+        except Exception as e:
+            self._attach_errors[arm] = f"could not be taken over ({e}); it holds as it was. {self.recovery(arm)}"
+            log.error("%s: %s", arm, self._attach_errors[arm])
+
+    def refuse_attach(self, arm: str, why: str) -> None:
+        """Leave an arm of ``attach_candidates`` as it is, reporting ``why`` as its fault."""
+        self._attach_errors[arm] = (f"it was not taken over: {why}. Nothing was sent to it; it holds as it was. "
+                                    f"{self.recovery(arm)}")
+        log.error("%s: %s", arm, self._attach_errors[arm])
 
     def recovery(self, name: str) -> str:
         """How the operator brings an arm left holding down to its rest pose and turns its torque off."""

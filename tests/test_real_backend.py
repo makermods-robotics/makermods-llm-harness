@@ -471,11 +471,12 @@ def test_an_arm_left_energized_is_attached_and_rested(kind):
     assert plain.close() == {"arm": "energized"}
 
     backend = backend_for(True)
+    assert backend.attach_candidates == ["arm"] and backend.read()["arm"].fault      # not yet: the harness checks
+    table = float(model.lowest_z(rest)) - 0.10
+    h = Harness.open(backend=backend, table_z=table, safety=SafetyConfig(max_speed_deg_s=120, slow_speed_deg_s=40))
     state = backend.read()["arm"]
     assert state.enabled is True and state.fault is None
     assert np.degrees(np.abs(np.array(sim.positions[:6]) - held)).max() < 0.05     # taken over without moving
-    table = float(model.lowest_z(rest)) - 0.10
-    h = Harness.open(backend=backend, table_z=table, safety=SafetyConfig(max_speed_deg_s=120, slow_speed_deg_s=40))
     obs = h.rest()
     assert obs.result.ok, obs.result.message
     assert np.degrees(np.abs(np.array(sim.positions[:6]) - rest)).max() < 2.0
@@ -523,13 +524,34 @@ def test_an_old_firmware_arm_carrying_load_is_held_by_another_program_and_attach
     held = np.array(sim.positions[:6])
     backend = RealBackend("maker", {}, {}, [ArmInfo("arm", "maker")], arms={"arm": arm}, rest_q={"arm": rest},
                           attach=True)
+    h = Harness.open(backend=backend, table_z=float(model.lowest_z(rest)) - 0.10,
+                     safety=SafetyConfig(max_speed_deg_s=120, slow_speed_deg_s=40))
     state = backend.read()["arm"]
     assert state.enabled is True and state.fault is None
     assert np.degrees(np.abs(np.array(sim.positions[:6]) - held)).max() < 0.05      # taken over where it held
-    h = Harness.open(backend=backend, table_z=float(model.lowest_z(rest)) - 0.10,
-                     safety=SafetyConfig(max_speed_deg_s=120, slow_speed_deg_s=40))
     assert h.rest().result.ok
     assert h.close() == {"arm": "released"}
+
+
+@pytest.mark.parametrize("missing", ["rest pose", "table", "way home"])
+def test_attach_leaves_a_held_arm_alone_without_a_rest_pose_a_table_or_a_checked_way_home(missing):
+    arm, sim, model, rest = held_by_a_dead_program()
+    held = np.array(sim.positions[:6])
+    backend = RealBackend("maker", {}, {}, [ArmInfo("arm", "maker")], arms={"arm": arm},
+                          rest_q={} if missing == "rest pose" else {"arm": rest}, attach=True)
+    table = {"rest pose": float(model.lowest_z(rest)) - 0.10, "table": None,
+             "way home": float(model.lowest_z(held)) + 0.02}[missing]       # the held pose lies under that table
+    h = Harness.open(backend=backend, table_z=table)
+    state = backend.read()["arm"]
+    assert "it was not taken over" in state.fault and "maker-arm rest --arm arm" in state.fault
+    assert {"rest pose": "no rest pose", "table": "no table calibration", "way home": "no checked way"}[missing] \
+        in state.fault
+    assert backend.group["arm"].state.name == "CONNECTED"                           # nothing sent to it
+    obs = h.step({"action": "rest"})
+    assert not obs.result.ok
+    assert np.degrees(np.abs(np.array(sim.positions[:6]) - held)).max() < 0.05
+    h.close()
+    assert backend.group["arm"].state.name != "ENABLED"
 
 
 def test_an_enable_the_sdk_refuses_for_a_held_arm_names_attach(rig, monkeypatch):

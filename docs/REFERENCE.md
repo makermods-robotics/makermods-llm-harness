@@ -183,7 +183,7 @@ arrived there. An arm with a fault, one whose way to rest the envelope refuses, 
 holding its pose with the motors on. Each of those commands then prints every arm's torque outcome and exits 1 when
 any arm is not confirmed off, with the command that brings that arm down (`metal-arm rest --arm NAME --pose ...`;
 `release` would drop it where it is). `serve` on a terminal first asks: Enter leaves the arm holding, `RELEASE` turns
-its torque off there (reported as off but NOT at its rest pose). `serve --attach` takes over an arm an earlier session left holding, so `rest` can bring it down.
+its torque off there (reported as off but NOT at its rest pose). `serve --attach` takes over an arm an earlier session left holding, so `rest` can bring it down; only with its rest pose recorded, a matching table calibration and a checked path from where it holds to rest (otherwise it is left as it is, its fault naming the SDK `rest` command).
 
 Underneath, the SDK runs each arm's control loop: it keeps targets inside the joint limits, limits speed, holds the
 pose on a fault, and confirms torque off motor by motor. The arms have no brakes: they drop when torque goes off away

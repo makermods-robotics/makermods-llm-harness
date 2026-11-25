@@ -398,5 +398,7 @@ arrive, torque left on by another program) is not moved: it holds its pose with 
 keeps holding it and waits: Enter leaves it holding and ends the session, `RELEASE` (once it is supported) turns its
 torque off there. The printed command, `metal-arm rest --arm NAME --pose <its rest pose>` (or `maker-arm`), then brings
 it down and turns torque off; `release` would turn torque off where it is and drop it. `llm-harness serve --attach`
-instead takes over an arm left holding where it is, and `rest` brings it down along a checked path. Motors that
+instead takes over an arm left holding where it is, and `rest` brings it down along a checked path; it takes the arm
+over only when its rest pose is recorded, a table calibration matches its setup and a checked path leads from where
+it holds to rest, and otherwise leaves it as it is and reports why with the `rest` command above. Motors that
 cannot report their torque state (older RobStride firmware) count as held when they carry load (more than 0.1 N*m).

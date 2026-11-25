@@ -963,7 +963,8 @@ def build_parser() -> _Parser:
     q.add_argument("--robot", help="robot name (default: the only robot)")
     q.add_argument("--read-only", action="store_true", help="refuse every action except observe and wait")
     q.add_argument("--attach", action="store_true",
-                   help="take over arms left holding with torque on by an earlier session; rest them first")
+                   help="take over arms left holding with torque on by an earlier session, when a checked path "
+                        "leads from where they hold to rest; rest them first")
     q.add_argument("--resume", nargs="?", const="", metavar="RUN_DIR",
                    help="continue an earlier episode (default: this robot's latest run)")
     q.set_defaults(func=cmd_serve)
