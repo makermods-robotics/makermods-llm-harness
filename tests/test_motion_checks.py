@@ -333,3 +333,82 @@ def test_mujoco_images_from_several_threads():
         worker.start()
         worker.join(60)
         assert first["errors"] == {} and looks[0]["errors"] == {}
+
+
+# ── a contact move that ends with a joint blocked short of its goal ──
+def blocked_short(h, monkeypatch, gap=0.013):
+    """Over the surface, with the surface ``gap`` m above the end of a 3 cm descent and the in-motion contact
+    detection kept from firing (as on a Metal arm sliding along the table): the descent ends with wrist_flex about
+    3 deg short of its goal on a 7.5 deg move, the tool point 13 mm short along the approach, standing still."""
+    from makermods_llm_harness import harness as harness_module
+    h.backend.surface_z = -1.0
+    r = over_the_surface(h)
+    h.backend.surface_z = h.state().arms["arm"].tool.xyz[2] - 0.03 + gap
+    monkeypatch.setattr(harness_module, "CONTACT_RATIO", -1.0)
+    return r
+
+
+def test_a_contact_move_ending_with_a_joint_blocked_short_and_standing_still_is_contact(sim_harness, monkeypatch):
+    h = sim_harness(backend=Surface(sim_backend().arms))
+    r = blocked_short(h, monkeypatch)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert result.status == "done" and result.contact is not None, result.message
+    assert "stopped on contact at the end of the move" in result.message
+    assert result.contact["short_m"] == pytest.approx(0.013, abs=0.003) and held(h)
+
+
+def test_the_same_ending_without_until_contact_stays_stopped(sim_harness, monkeypatch):
+    h = sim_harness(backend=Surface(sim_backend().arms))
+    r = blocked_short(h, monkeypatch)
+    result = r.nudge([0, 0, -0.03])
+    assert result.status == "stopped" and result.contact is None
+    assert "deg from its goal on a 7.5 deg move" in result.message and held(h)
+
+
+def test_the_same_contact_ending_while_still_moving_stays_stopped(sim_harness, monkeypatch):
+    class Creeping(Surface):
+        creep = 0.0
+
+        def read(self):
+            states = super().read()
+            if self.creep:
+                self.creep += math.radians(0.5)
+                for state in states.values():
+                    state.q = state.q.copy()
+                    state.q[1] += self.creep
+            return states
+
+        def hold(self, arm):                             # held where it is read: the creep ends there
+            for a in self._arms.values():
+                a.q[1] += self.creep
+            self.creep = 0.0
+            return super().hold(arm)
+
+    h = sim_harness(backend=Creeping(sim_backend().arms))
+    r = blocked_short(h, monkeypatch)
+    real = Harness._arrival
+
+    def arrival(self, *args, **kwargs):                 # the joint creeps on once the command has ended
+        self.backend.creep = 1e-9
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(Harness, "_arrival", arrival)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert result.status == "stopped" and result.contact is None
+    assert "deg from its goal on a 7.5 deg move" in result.message
+
+
+def test_the_same_contact_ending_with_a_stop_request_stays_stopped(sim_harness, monkeypatch):
+    from makermods_llm_harness import harness as harness_module
+    h = sim_harness(backend=Surface(sim_backend().arms))
+    r = blocked_short(h, monkeypatch)
+    real_sleep = time.sleep
+
+    def sleep(seconds):
+        if seconds == harness_module.STILL_S:              # the end-of-move contact check: a stop lands here
+            stopper = threading.Thread(target=h.stop)
+            stopper.start()
+            stopper.join(10)
+        real_sleep(seconds)
+    monkeypatch.setattr(harness_module.time, "sleep", sleep)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert result.status == "stopped" and result.contact is None and "on request" in result.message

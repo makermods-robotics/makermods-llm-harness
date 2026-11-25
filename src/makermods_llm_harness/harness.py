@@ -78,6 +78,11 @@ class HarnessClosed(RuntimeError):
     """The harness is closed: it takes no more actions or observations."""
 
 
+class _BlockedShort(Result):
+    """A move with until contact that ended with a joint blocked short of its goal, not yet held: ``_arrival``
+    reports contact when the tool point stands still short along the approach, else holds it as stopped."""
+
+
 class _Outcome(Exception):
     """Ends an action early with this result."""
 
@@ -632,7 +637,8 @@ class Harness:
         is a move that ended more than the contact tolerance short along the approach, whatever the arrival
         tolerance. ``contact``: the move asked for contact; ending more than the contact tolerance short and standing
         still over STILL_S (no stop request meanwhile, valid fresh feedback after it) is contact (``_on_contact``),
-        and short while still moving is ``stopped``."""
+        and short while still moving is ``stopped``. So is a contact move that ended with a joint blocked short of
+        its goal (``_BlockedShort``); any other such ending is held as ``stopped``."""
         model = self.models[name]
         with self._io:
             state = self._dev.read()[name]
@@ -653,7 +659,8 @@ class Harness:
         if short is not None:
             result.error["short_m"] = round(short, 4)
         tolerance = self.config.contact_tolerance_m
-        if result.ok and contact and short is not None and short > tolerance:
+        blocked = isinstance(result, _BlockedShort)
+        if (result.ok or blocked) and contact and short is not None and short > tolerance:
             time.sleep(STILL_S)
             with self._gate, self._io:                # a stop either came first (seen here) or holds after this read
                 stopped = self._abort is not None and self._abort.is_set()
@@ -668,8 +675,13 @@ class Harness:
             moved = float(np.linalg.norm(model.tool_points(later.q) - model.tool_points(state.q)))
             if moved < COMMAND_MOVED_M:
                 return self._on_contact(name, goal, later.q, result.error, at_end=True)
-            held = self._hold(name, f"{name}: ended {short * 1000:.0f} mm short of the target along the approach "
-                                    "and was still moving. The arm holds where it is; look at the cameras.")
+            held = self._hold(name, result.message if blocked else
+                              f"{name}: ended {short * 1000:.0f} mm short of the target along the approach and was "
+                              "still moving. The arm holds where it is; look at the cameras.")
+            held.error = result.error
+            return held
+        if blocked:
+            held = self._hold(name, result.message)
             held.error = result.error
             return held
         if result.ok and not contact and short is not None and short > tolerance:
@@ -919,7 +931,8 @@ class Harness:
         ``judge_motion`` decides from the start (``q0``, and ``start_command``, the command the arm held before),
         the goal and the end, with ``held`` joints (kept at their command) judged on drift only and ``requested``
         joints (asked for by name) held to the small-move rule. Anything but done holds the arm and confirms it
-        (``_hold``). ``rest`` lets a hot arm go on; ``floor`` lowers the measured clearance it is held under (the
+        (``_hold``), except a contact move that ended with a joint blocked short of its goal: that comes back unheld
+        as ``_BlockedShort`` for ``_arrival`` to judge. ``rest`` lets a hot arm go on; ``floor`` lowers the measured clearance it is held under (the
         way down to a rest pose under the floor).
 
         With ``contact_goal`` (until contact, the requested tool pose) the motion ends, done, on contact: once the
@@ -1017,6 +1030,8 @@ class Harness:
                                 f"{math.degrees(abs(goal[j] - start_command[j])):.2f} "
                                 f"deg and moved {math.degrees(abs(state.q[j] - q0[j])):.2f} deg, too little to tell a "
                                 "move from a block"}[kind]
+        if kind == "short" and contact_goal is not None:
+            return _BlockedShort("stopped", f"{name}: {what}. The arm holds where it is; look at the cameras.")
         return self._hold(name, f"{name}: {what}. The arm holds where it is; look at the cameras.")
 
     @staticmethod
