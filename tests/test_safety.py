@@ -301,7 +301,7 @@ def test_a_table_per_reach_moves_the_floor_with_the_reach():
     z = flat.table_z
     tip = MODEL.fingertip(HOME)
     reach = float(np.hypot(tip[0], tip[1]))
-    rising = Envelope(MODEL, CFG, Table(z, ((reach - 0.1, z), (reach, z + 0.05))))
+    rising = Envelope(MODEL, CFG, Table(z, ((0.0, z), (reach - 0.1, z), (reach, z + 0.05), (reach + 1.0, z + 0.05))))
     assert rising.table_under(tip) == pytest.approx(z + 0.05)
     assert rising.clearance(HOME) == pytest.approx(flat.clearance(HOME) - 0.05, abs=1e-9)
     assert rising.guarded_clearance(HOME) == pytest.approx(flat.guarded_clearance(HOME) - 0.05, abs=1e-6)
@@ -340,3 +340,17 @@ def test_a_table_per_reach_is_stored_and_used(sim_harness):
         assert "0.0487 m at 0.26 m" in h.describe()
     finally:
         h.close()
+
+
+def test_outside_its_measured_reaches_a_table_per_reach_is_taken_high():
+    from makermods_llm_harness.safety import OUTSIDE_MARGIN_M, Table
+    rising = Table.measured([(0.26, 0.050), (0.33, 0.057)])           # 1 mm per cm, still rising at the end
+    at = lambda reach: float(rising.at(np.array([reach, 0.0, 0.0]), (0.0, 0.0)))  # noqa: E731
+    assert at(0.30) == pytest.approx(0.054)                             # inside: linear
+    assert at(0.41) == pytest.approx(0.065)                             # beyond: the slope carried on ...
+    assert at(0.34) == pytest.approx(0.057 + OUTSIDE_MARGIN_M)          # ... or the highest plus the margin
+    assert at(0.20) == pytest.approx(0.057 + OUTSIDE_MARGIN_M)          # closer in: never lower than that
+    bump = Table.measured([(0.27, 0.062), (0.30, 0.057), (0.345, 0.061)])
+    assert float(bump.at(np.array([0.41, 0.0, 0.0]), (0.0, 0.0))) >= 0.062 + OUTSIDE_MARGIN_M - 1e-9
+    flat = Table(0.05)
+    assert float(flat.at(np.array([0.9, 0.0, 0.0]), (0.0, 0.0))) == 0.05

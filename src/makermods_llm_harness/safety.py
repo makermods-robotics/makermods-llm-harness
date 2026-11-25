@@ -27,14 +27,15 @@ from .robot import home
 TOUCH_TOLERANCE_M = 0.003    # two touch readings must agree this well
 TOUCH_ATTEMPTS = 3
 RECOVERY_EPS_M = 5e-4        # path-following noise of a planned lift: a passing dip this small is not a descent
+OUTSIDE_MARGIN_M = 0.005     # a table per reach, outside its measured reaches: at least this above its highest point
 REST_TOLERANCE_DEG = 5.0     # per joint: how close to the recorded rest pose an arm must be to turn on or off
 
 
 @dataclass(frozen=True)
 class Table:
     """The table height under one arm (world z, m): ``z`` everywhere, or with ``reach`` a height that depends on the
-    horizontal distance from the arm base, linear between ``(reach_m, z_m)`` points and held flat beyond them (an
-    arm whose kinematic model drifts with extension sees a flat table at different heights). ``z`` is the height
+    horizontal distance from the arm base, linear between ``(reach_m, z_m)`` points and taken conservatively high
+    outside them (``at``; an arm whose kinematic model drifts with extension sees a flat table at different heights). ``z`` is the height
     reported in words; with ``reach`` it is their mean."""
     z: float
     reach: tuple = ()
@@ -57,19 +58,28 @@ class Table:
         return cls(rows[0][1]) if len(rows) == 1 else cls(float(np.mean([h for _, h in rows])), tuple(rows))
 
     def at(self, points: np.ndarray, base_xy) -> np.ndarray:
-        """The table height under each of ``points`` (..., 3), world frame, for an arm based at ``base_xy``."""
+        """The table height under each of ``points`` (..., 3), world frame, for an arm based at ``base_xy``: linear
+        between the measured reaches; outside them, the higher of the highest measured height plus OUTSIDE_MARGIN_M
+        and the end segment carried on (a table seen higher with extension keeps rising beyond the last point)."""
         points = np.asarray(points, dtype=float)
         if not self.reach:
             return np.full(points.shape[:-1], self.z)
         reach = np.hypot(points[..., 0] - base_xy[0], points[..., 1] - base_xy[1])
-        r, h = zip(*self.reach)
-        return np.interp(reach, r, h)
+        r, h = (np.array(v, dtype=float) for v in zip(*self.reach))
+        inside = np.interp(reach, r, h)
+        top = float(h.max()) + OUTSIDE_MARGIN_M
+        if len(r) == 1:
+            return np.where((reach < r[0]) | (reach > r[-1]), top, inside)
+        near = h[0] + (reach - r[0]) * (h[1] - h[0]) / (r[1] - r[0])
+        far = h[-1] + (reach - r[-1]) * (h[-1] - h[-2]) / (r[-1] - r[-2])
+        return np.where(reach < r[0], np.maximum(top, near), np.where(reach > r[-1], np.maximum(top, far), inside))
 
     def text(self) -> str:
         if not self.reach:
             return f"z = {self.z:.3f} m"
         return ("z = " + ", ".join(f"{h:.4f} m at {r:.2f} m" for r, h in self.reach)
-                + " from the base (linear between, flat beyond)")
+                + " from the base (linear between; outside, the highest plus "
+                + f"{OUTSIDE_MARGIN_M * 1000:.0f} mm or the end slope carried on, whichever is higher)")
 
 
 @dataclass(frozen=True)
