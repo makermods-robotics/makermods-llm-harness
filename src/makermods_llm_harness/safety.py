@@ -139,7 +139,7 @@ LIMITS: dict[str, tuple[float, float]] = {
     "floor_margin_m": (0.0, 0.2), "max_excursion_deg": (1.0, 360.0), "max_temp_c": (20.0, 100.0),
     "tracking_tolerance_deg": (0.5, 30.0), "tracking_lag_s": (0.0, 0.5), "settle_s": (0.0, 5.0),
     "contact_tolerance_m": (0.001, 0.05), "floor_tolerance_deg": (0.0, 10.0), "sag_allowance_m": (0.0, 0.05),
-    "contact_allowance_m": (0.0, 0.05), "rate_hz": (5.0, 200.0), "keep_out_margin_m": (0.0, 0.2),
+    "contact_allowance_m": (0.0, 0.05), "contact_depth_m": (0.0, 0.03), "rate_hz": (5.0, 200.0), "keep_out_margin_m": (0.0, 0.2),
     "finger_length_m": (0.0, 0.3), "jaw_half_width_m": (0.0, 0.3), "finger_margin_m": (0.0, 0.05),
 }
 
@@ -178,6 +178,9 @@ class SafetyConfig:
     # A moving arm is held once a measured monitored point is this far below the floor (a compliant fingertip
     # pressing on the table does not stop it).
     contact_allowance_m: float = 0.010
+    # A move with until "contact" may aim this far under the hard floor (the table, by default), so that a
+    # descent onto a correctly stored table can end short of its target, on contact. Other moves may not.
+    contact_depth_m: float = 0.015
     rate_hz: float = 25.0              # joint targets per second while moving
     keep_out_margin_m: float = 0.03    # planned paths keep every point along the arm this far from keep-out zones
     # Gripper geometry; None takes arm_model.GRIPPERS for the arm type. Measure them on the installed tool.
@@ -186,7 +189,7 @@ class SafetyConfig:
     finger_margin_m: Optional[float] = None
     OPTIONAL: ClassVar[tuple[str, ...]] = ("finger_length_m", "jaw_half_width_m", "finger_margin_m")
     ZERO_OK: ClassVar[tuple[str, ...]] = ("floor_margin_m", "floor_tolerance_deg", "sag_allowance_m",
-                                          "contact_allowance_m", "keep_out_margin_m", "tracking_lag_s", "settle_s")
+                                          "contact_allowance_m", "contact_depth_m", "keep_out_margin_m", "tracking_lag_s", "settle_s")
 
     def __post_init__(self):
         for f in fields(self):
@@ -329,9 +332,10 @@ class Envelope:
         clearance = self.clearance(np.vstack([q_start, path]))
         return self.slow_speed if float(np.min(clearance)) < self.config.slow_zone_m else self.max_speed
 
-    def check(self, q_start, path, capped: bool = True, rest_q=None) -> None:
+    def check(self, q_start, path, capped: bool = True, rest_q=None, contact: bool = False) -> None:
         """Raise MoveRejected unless every waypoint of ``path`` (T, 6), sent in order after ``q_start``, keeps
-        every rule. ``capped=False`` lifts the excursion cap (moves to the known home and rest poses). A path
+        every rule. ``capped=False`` lifts the excursion cap (moves to the known home and rest poses). ``contact``:
+        a move with until contact, whose floor lies ``contact_depth_m`` under the hard floor. A path
         that ends at ``rest_q``, the recorded rest pose where the arm sits supported, may end under the floor
         (see ``_rest_approach``)."""
         self.require_table()
@@ -356,7 +360,7 @@ class Envelope:
                                    f"over the {cfg.max_excursion_deg:g} deg per-action limit (safety setting "
                                    "max_excursion_deg). Split the motion into smaller steps.")
         try:
-            self._check_floor(q_start, path)
+            self._check_floor(q_start, path, contact)
         except MoveRejected:
             if rest_q is None or not self._rest_approach(q_start, path, rest_q):
                 raise
@@ -432,11 +436,13 @@ class Envelope:
                                f"{depth:.0f} mm in. From here only motions that keep moving out of the zone are "
                                "allowed: move away from it first.")
 
-    def _check_floor(self, q_start, path) -> None:
-        """Every waypoint's guarded clearance stays above the floor. From under it (recovery), the clearance may
-        never drop below the highest it has reached (by more than RECOVERY_EPS_M on the way, at all at the end), and
-        once a waypoint is above the floor the rest stay there."""
-        name, floor = self.model.name, self.config.floor_margin_m
+    def _check_floor(self, q_start, path, contact: bool = False) -> None:
+        """Every waypoint's guarded clearance stays above the floor (``contact``: the hard floor less
+        ``contact_depth_m``). From under it (recovery), the clearance may never drop below the highest it has
+        reached (by more than RECOVERY_EPS_M on the way, at all at the end), and once a waypoint is above the floor
+        the rest stay there."""
+        name, floor = self.model.name, self.config.floor_margin_m - (self.config.contact_depth_m if contact else 0.0)
+        kind = "floor of a move with until contact" if contact else "hard floor"
         guarded = self.guarded_clearance(np.vstack([q_start, path]))
         nominal = self.clearance(np.vstack([q_start, path]))
         if not np.all(np.isfinite(guarded)):
@@ -452,8 +458,8 @@ class Envelope:
             if guarded[t] < floor:
                 room = (guarded[0] - floor) * 1000
                 refuse(t, f"{name}: that motion would bring the {{what}} to {{mm:.0f}} mm above the table "
-                          "({guarded:.0f} mm allowing for tracking error and sag), under the {floor:.0f} mm hard "
-                          f"floor. From here the lowest point may come down at most {room:.0f} mm (its clearance); "
+                          f"({{guarded:.0f}} mm allowing for tracking error and sag), under the {{floor:.0f}} mm "
+                          f"{kind}. From here the lowest point may come down at most {room:.0f} mm (its clearance); "
                           "aim at that or higher.")
             return
         best = np.maximum.accumulate(nominal)
@@ -464,7 +470,7 @@ class Envelope:
         later = np.flatnonzero(guarded[above[0]:] < floor) + above[0] if len(above) else np.array([], int)
         if len(dips) or len(later):
             t = int(np.argmin(nominal[1:])) + 1 if len(dips) else int(later[0])
-            refuse(t, f"{name}: the arm is {{start:.0f}} mm above the table, under the {{floor:.0f}} mm hard floor "
+            refuse(t, f"{name}: the arm is {{start:.0f}} mm above the table, under the {{floor:.0f}} mm {kind} "
                       "once tracking error and sag are allowed for, and that motion would take the {what} down to "
                       "{mm:.0f} mm. From here only motions that keep gaining height are allowed: lift first (for "
                       "example nudge dxyz [0, 0, 0.02]).")

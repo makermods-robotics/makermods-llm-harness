@@ -412,3 +412,29 @@ def test_the_same_contact_ending_with_a_stop_request_stays_stopped(sim_harness, 
     monkeypatch.setattr(harness_module.time, "sleep", sleep)
     result = r.nudge([0, 0, -0.03], until="contact")
     assert result.status == "stopped" and result.contact is None and "on request" in result.message
+
+
+# ── a contact move onto a correctly stored table ──
+class OnTable(SimBackend):
+    """The arm stops where its lowest point would go under the table the harness has stored (``table_z``)."""
+
+    def step(self, targets, dt):
+        before = {name: a.q.copy() for name, a in self._arms.items()}
+        super().step(targets, dt)
+        for name, a in self._arms.items():
+            if a.model.lowest_z(a.q) < self.table_z:
+                a.q = before[name]
+
+
+def test_a_contact_move_may_aim_a_bounded_depth_under_a_correctly_stored_table(sim_harness):
+    h = sim_harness(backend=OnTable(sim_backend().arms))
+    r = over_the_surface(h)
+    clearance = h.state().arms["arm"].clearance_m
+    plain = r.nudge([0, 0, -(clearance + 0.012)], dry_run=True)
+    assert plain.status == "rejected" and "hard floor" in plain.message           # other moves: not under it
+    deep = r.nudge([0, 0, -(clearance + 0.020)], until="contact", dry_run=True)   # past the 15 mm contact depth
+    result = r.nudge([0, 0, -(clearance + 0.012)], until="contact")
+    assert result.status == "done" and result.contact is not None, result.message
+    assert deep.status == "rejected" and "floor of a move with until contact" in deep.message
+    assert h.state().arms["arm"].clearance_m == pytest.approx(0.0, abs=0.003)     # it stopped on the table
+    assert SafetyConfig().contact_depth_m == 0.015

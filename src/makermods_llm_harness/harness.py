@@ -838,7 +838,7 @@ class Harness:
         else:
             q1 = model.home_q if isinstance(act, Home) else self._joint_goal(model, q0, act)
             path = self._plan(env, model.plan_joint_path, q0, q1, **timing)
-        env.check(q0, path, capped=not isinstance(act, Home))
+        env.check(q0, path, capped=not isinstance(act, Home), contact=getattr(act, "until", None) == "contact")
         cap = env.speed_for(q0, path) if measured is None else min(env.speed_for(q0, path),
                                                                   env.speed_for(measured, path))
         if speed is not None:
@@ -1429,7 +1429,8 @@ class Harness:
                   f"{cfg.floor_margin_m * 1000:.0f} mm above the table even with every joint "
                   f"{cfg.floor_tolerance_deg:g} deg off and {cfg.sag_allowance_m * 1000:.0f} mm of sag (0 mm: they "
                   "may touch it); an arm already below that may only keep gaining height; a measured point more than "
-                  f"{cfg.contact_allowance_m * 1000:.0f} mm under that stops the motion;",
+                  f"{cfg.contact_allowance_m * 1000:.0f} mm under that stops the motion; a move with until contact "
+                  f"may aim up to {cfg.contact_depth_m * 1000:.0f} mm under the floor, to end on contact;",
                   f"- one action turns no joint more than {cfg.max_excursion_deg:g} deg (home and rest are exempt): "
                   "split long motions;",
                   f"- no motion while a motor is above {cfg.max_temp_c:g} C; a joint more than "
