@@ -69,7 +69,6 @@ def probe_table(harness: Harness, arm: str, points: Sequence[tuple], expect_z: f
         _expect_done(harness.step({"action": "gripper", "opening": 0.0, "arm": arm}), "close the jaws")
         for x, y in points:
             found.append(_probe_point(harness, arm, float(x), float(y), expect_z, limit_z, say))
-            _expect_done(harness.step({"action": "home", "arm": arm}), "home")
     finally:
         rested = harness.step({"action": "rest", "arm": arm}).result
         if not rested.ok:
@@ -172,7 +171,7 @@ def _pitch(harness: Harness, arm: str, x, y, yaw, expect_z, limit_z) -> float:
 
 
 def _reach_above(harness: Harness, arm: str, x, y, yaw, pitch, tip_z) -> None:
-    """From home to the fingertips at (x, y, tip_z), in as few moves as the per-action limit allows."""
+    """From where the tool is to the fingertips at (x, y, tip_z), in as few moves as the per-action limit allows."""
     model = harness.models[arm]
     goal = _move(model, x, y, tip_z, pitch, yaw, arm)
     start = harness.state().arms[arm].tool
