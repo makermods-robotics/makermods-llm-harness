@@ -626,10 +626,11 @@ class Harness:
         approach). Done only from valid, fresh final feedback (no fault, finite joints, torque on, every joint's
         sample at most FRESH_HOLD_S old; a fault otherwise) with the measured tool pose within the arrival
         tolerance. A miss that the joint ``standing`` error the arm held before the move (command minus measurement)
-        explains, up to SAG_ARRIVAL_TOL_M, is done with the miss in the message, unless the tool point ended more
-        than the contact tolerance short along the approach: that is ``stopped``, as is any other miss. ``contact``:
-        the move asked for contact; ending more than the contact tolerance short, standing still, is contact
-        (``_on_contact``), and short while still moving is ``stopped``."""
+        explains, up to SAG_ARRIVAL_TOL_M, is done with the miss in the message; any other miss is ``stopped``, and so
+        is a move that ended more than the contact tolerance short along the approach, whatever the arrival
+        tolerance. ``contact``: the move asked for contact; ending more than the contact tolerance short and standing
+        still over STILL_S (no stop request meanwhile, valid fresh feedback after it) is contact (``_on_contact``),
+        and short while still moving is ``stopped``."""
         model = self.models[name]
         with self._io:
             state = self._dev.read()[name]
@@ -652,8 +653,16 @@ class Harness:
         tolerance = self.config.contact_tolerance_m
         if result.ok and contact and short is not None and short > tolerance:
             time.sleep(STILL_S)
-            with self._io:
+            with self._gate, self._io:                # a stop either came first (seen here) or holds after this read
+                stopped = self._abort is not None and self._abort.is_set()
                 later = self._dev.read()[name]
+                ages = self._dev.feedback_ages(name)
+            if stopped:
+                return self._hold(name, f"{name}: stopped on request; the arm holds where it is.")
+            fresh = ages is None or all(age is not None and math.isfinite(age) and age <= FRESH_HOLD_S for age in ages)
+            if later.fault or later.enabled is not True or not np.all(np.isfinite(later.q)) or not fresh:
+                return self._hold(name, f"{name}: the feedback after the move is not valid ("
+                                        f"{later.fault or 'torque state or fresh feedback missing'}).", "fault")
             moved = float(np.linalg.norm(model.tool_points(later.q) - model.tool_points(state.q)))
             if moved < COMMAND_MOVED_M:
                 return self._on_contact(name, goal, later.q, result.error, at_end=True)
@@ -661,18 +670,18 @@ class Harness:
                                     "and was still moving. The arm holds where it is; look at the cameras.")
             held.error = result.error
             return held
+        if result.ok and not contact and short is not None and short > tolerance:
+            held = self._hold(name, f"{name}: ended {short * 1000:.0f} mm short of the target along the approach "
+                                    f"({position * 1000:.0f} mm and {math.degrees(angle):.1f} deg from it). It may "
+                                    "rest on something, or the arm sags there: the arm holds where it is. Aim "
+                                    f"{short * 1000:.0f} mm further, or move with until contact.")
+            held.error = result.error
+            return held
         if result.ok and (position > ARRIVAL_TOL_M or math.degrees(angle) > ARRIVAL_TOL_DEG):
             explained = False
             if standing is not None:
                 p2, a2 = pose_error(model.tool_pose(np.clip(state.q + standing, model.lo, model.hi)), goal)
                 explained = p2 <= ARRIVAL_TOL_M and math.degrees(a2) <= ARRIVAL_TOL_DEG
-            if short is not None and short > tolerance:
-                held = self._hold(name, f"{name}: ended {short * 1000:.0f} mm short of the target along the approach "
-                                        f"({position * 1000:.0f} mm and {math.degrees(angle):.1f} deg from it). It may "
-                                        "rest on something, or the arm sags there: the arm holds where it is. Aim "
-                                        f"{short * 1000:.0f} mm further, or move with until contact.")
-                held.error = result.error
-                return held
             if explained and position <= SAG_ARRIVAL_TOL_M and math.degrees(angle) <= SAG_ARRIVAL_TOL_DEG:
                 result.message = (f"{name}: ended {position * 1000:.0f} mm and {math.degrees(angle):.1f} deg from "
                                   "the target, which the standing error its joints held before the move explains.")

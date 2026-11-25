@@ -409,3 +409,30 @@ def test_maker_jaws_do_not_open_at_the_rest_pose(sim_harness):
     assert_done(h.step({"action": "gripper", "opening": 1.0}))
     metal = sim_harness(arm="metal")
     assert_done(metal.step({"action": "gripper", "opening": 1.0}))          # its jaws open at rest
+
+
+def test_a_tighter_contact_tolerance_stops_a_move_short_within_the_arrival_tolerance(sim_harness):
+    from makermods_llm_harness import SafetyConfig
+    h = sim_harness(backend=Sag(sim_backend().arms), safety=SafetyConfig(contact_tolerance_m=0.003))
+    assert_done(h.step({"action": "home"}))
+    sagging(h, 0.006)                                     # 6 mm: inside the 10 mm arrival tolerance
+    obs = h.step({"action": "nudge", "dxyz": [0, 0, -0.05]})
+    assert obs.result.status == "stopped" and "short of the target along the approach" in obs.result.message
+    assert obs.result.error["short_m"] == pytest.approx(0.006, abs=0.003)
+
+
+def test_a_stop_during_the_final_contact_check_is_not_contact(sim_harness, monkeypatch):
+    h = sim_harness(backend=Sag(sim_backend().arms))
+    assert_done(h.step({"action": "home"}))
+    sagging(h, 0.018)
+    real_sleep = time.sleep
+
+    def sleep(seconds):
+        if seconds == harness_module.STILL_S:              # the final contact check: an operator stop lands here
+            stopper = threading.Thread(target=h.stop)
+            stopper.start()
+            stopper.join(10)
+        real_sleep(seconds)
+    monkeypatch.setattr(harness_module.time, "sleep", sleep)
+    obs = h.step({"action": "nudge", "dxyz": [0, 0, -0.05], "until": "contact"})
+    assert obs.result.status == "stopped" and obs.result.contact is None and "on request" in obs.result.message
