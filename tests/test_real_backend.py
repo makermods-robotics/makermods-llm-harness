@@ -562,6 +562,8 @@ class Camera:
     def newest(self, max_age_s=None):
         if self.id == "old" and max_age_s is not None:
             return None
+        if self.id == "stalls":
+            time.sleep(3600)
         return Frame(np.full((4, 6, 3), 7, np.uint8), time.time(), time.monotonic())
 
     def close(self):
@@ -590,6 +592,43 @@ def test_cameras_built_from_ids_run_in_a_helper_process(tmp_path, monkeypatch):
     old.close()
     with pytest.raises(OSError, match="did not open: no such camera"):
         CameraProcess("fake_cameras", "broken").open()
+
+
+@pytest.mark.parametrize("then", ["wait", "close"])
+def test_a_camera_helper_that_stalls_is_killed_and_never_blocks(tmp_path, monkeypatch, then):
+    import os
+    import signal
+    from makermods_llm_harness.backends import camera_process
+    (tmp_path / "fake_cameras.py").write_text(FAKE_CAMERAS)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    frame_s, close_s = getattr(camera_process, "FRAME_S", 1.0), getattr(camera_process, "CLOSE_S", 1.0)
+    camera = camera_process.CameraProcess("fake_cameras", "stalls")
+    camera.open()
+    proc = camera._proc
+    got = []
+    reader = threading.Thread(target=lambda: got.append(camera.newest(1.0)), daemon=True)
+    try:
+        start = time.monotonic()
+        reader.start()
+        if then == "close":                       # quit while a frame request is stuck: close does not wait on it
+            time.sleep(0.3)
+            closer = threading.Thread(target=camera.close, daemon=True)
+            closer.start()
+            closer.join(close_s + 1.0)
+            assert not closer.is_alive()
+        reader.join(frame_s + 1.5)
+        assert not reader.is_alive() and got == [None] and time.monotonic() - start < frame_s + 1.5
+        deadline = time.monotonic() + 2.0
+        while proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert proc.poll() is not None                                    # killed and reaped
+        t = time.monotonic()
+        assert camera.newest(1.0) is None and time.monotonic() - t < 0.1  # no frame, no wait, from then on
+    finally:
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGKILL)
+        camera.close()
 
 
 def test_a_backend_from_camera_ids_uses_helper_processes(monkeypatch):

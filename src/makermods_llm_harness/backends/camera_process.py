@@ -3,12 +3,14 @@
 A camera's receive and decode work (an MJPEG stream parsed and every frame decoded, 30 times a second) shares the
 interpreter lock with the arms' control loops when it runs in their process, and slows them. Here the SDK camera
 runs in a child Python process, on the computer's slowest CPUs when its CPUs differ (the control loops keep the fast
-ones); this process asks it for the newest frame only when it needs one.
+ones); this process asks it for the newest frame only when it needs one. Every reply has a deadline: a helper that
+does not answer in time is killed (and reaped in the background), so no caller ever waits on a stalled camera.
 """
 
 from __future__ import annotations
 
 import pickle
+import queue
 import struct
 import subprocess
 import sys
@@ -17,6 +19,8 @@ from typing import Optional
 
 _HEADER = struct.Struct("<I")
 START_S = 10.0          # longest wait for the helper to open its camera
+FRAME_S = 1.0           # longest wait for a frame
+CLOSE_S = 1.0           # longest wait for the helper to end once asked to; then it is killed
 
 
 def _send(stream, obj) -> None:
@@ -38,48 +42,54 @@ def _receive(stream):
 
 class CameraProcess:
     """``module.Camera(camera_id)`` (an SDK cameras module) opened and read in a helper process, with the SDK
-    camera's ``open``, ``newest`` and ``close``. ``newest`` returns the module's ``Frame``."""
+    camera's ``open``, ``newest`` and ``close``. ``newest`` returns the module's ``Frame``. A thread reads the
+    helper's replies; a reply later than START_S (opening) or FRAME_S (a frame) kills the helper."""
 
     def __init__(self, module: str, camera_id: str):
         self.module, self.camera_id = module, camera_id
         self._proc: Optional[subprocess.Popen] = None
+        self._replies: Optional[queue.Queue] = None
         self._lock = threading.Lock()
 
     def open(self) -> None:
-        self._proc = subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, "-c", f"from {__package__} import camera_process; camera_process._serve()"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-        timer = threading.Timer(START_S, self._proc.kill)
-        timer.start()
+        replies: queue.Queue = queue.Queue()
+        threading.Thread(target=_read_replies, args=(proc.stdout, replies), daemon=True,
+                         name=f"camera {self.camera_id} replies").start()
+        self._proc, self._replies = proc, replies
         try:
-            _send(self._proc.stdin, (self.module, self.camera_id))
-            status, detail = _receive(self._proc.stdout)
-        except (EOFError, OSError) as e:
+            _send(proc.stdin, (self.module, self.camera_id))
+            status, detail = self._reply(replies, START_S)
+        except (EOFError, OSError, TimeoutError) as e:
             self.close()
             raise OSError(f"camera {self.camera_id}: its helper process ended ({e})") from e
-        finally:
-            timer.cancel()
         if status != "ok":
             self.close()
             raise OSError(detail)
 
     def newest(self, max_age_s: Optional[float] = None):
-        """The helper camera's newest frame, or None (none, too old, or the helper has ended)."""
+        """The helper camera's newest frame, or None (none, too old, the helper has ended, or it did not answer
+        within FRAME_S: it is then killed)."""
         with self._lock:
-            if self._proc is None or self._proc.poll() is not None:
+            proc, replies = self._proc, self._replies
+            if proc is None or proc.poll() is not None:
                 return None
             try:
-                _send(self._proc.stdin, max_age_s)
-                reply = _receive(self._proc.stdout)
-            except (EOFError, OSError):
+                _send(proc.stdin, max_age_s)
+                reply = self._reply(replies, FRAME_S)
+            except (EOFError, OSError, TimeoutError):
+                self._end(proc)
                 return None
         if reply is None:
             return None
         return _frame_type(self.module)(*reply)
 
     def close(self) -> None:
-        with self._lock:
-            proc, self._proc = self._proc, None
+        """End the helper (killed after CLOSE_S); never waits for a frame request in progress, which then returns
+        None."""
+        proc, self._proc = self._proc, None
         if proc is None:
             return
         try:
@@ -87,10 +97,37 @@ class CameraProcess:
         except OSError:
             pass
         try:
-            proc.wait(timeout=3.0)
+            proc.wait(timeout=CLOSE_S)
         except subprocess.TimeoutExpired:
+            self._end(proc)
+
+    def _reply(self, replies: queue.Queue, timeout: float):
+        try:
+            kind, value = replies.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(f"no reply within {timeout:g} s") from None
+        if kind == "end":
+            raise EOFError(str(value))
+        return value
+
+    def _end(self, proc: subprocess.Popen) -> None:
+        """Kill the helper and reap it in the background."""
+        if self._proc is proc:
+            self._proc = None
+        try:
             proc.kill()
-            proc.wait()
+        except OSError:
+            pass
+        threading.Thread(target=proc.wait, daemon=True, name=f"camera {self.camera_id} reaper").start()
+
+
+def _read_replies(stream, replies: queue.Queue) -> None:
+    """Put each reply of the helper on ``replies`` as ("reply", value); ("end", why) once its pipe closes."""
+    try:
+        while True:
+            replies.put(("reply", _receive(stream)))
+    except Exception as e:   # noqa: BLE001 - a closed or broken pipe ends the reader either way
+        replies.put(("end", e))
 
 
 def _frame_type(module: str):
