@@ -256,3 +256,27 @@ def test_the_probe_judges_its_steps_with_its_own_contact_tolerance(bench, monkey
     cli.calibrate_powered(robots.load("bench"), ["left"], points=POINTS[:1], expect=0.05, yes=True,
                           say=lambda s: None)
     assert seen == [0.010] and probe.SHORT_M == 0.010
+
+
+# The first point of a powered probe on a Maker arm, (commanded, measured fingertip z, stood still) per step: free
+# descent 2-5 mm above the command, then the fingertips meet the table near z = 0.055 and, pressed on, read up to
+# 4 mm higher while the command goes on down.
+MAKER_ROWS = [
+    (0.1203, 0.1225, True), (0.1183, 0.1221, True), (0.1163, 0.1191, True), (0.1143, 0.1163, True),
+    (0.1123, 0.1142, True), (0.1103, 0.1138, True), (0.1083, 0.1113, True), (0.1063, 0.1094, True),
+    (0.1043, 0.1076, True), (0.1023, 0.1041, True), (0.1003, 0.1038, True), (0.0983, 0.1015, True),
+    (0.0963, 0.0992, True), (0.0943, 0.0968, True), (0.0923, 0.0962, True), (0.0903, 0.0936, True),
+    (0.0883, 0.0912, True), (0.0863, 0.089, True), (0.0843, 0.0873, True), (0.0823, 0.0863, True),
+    (0.0803, 0.0847, True), (0.0783, 0.082, True), (0.0763, 0.0792, True), (0.0743, 0.0784, True),
+    (0.0723, 0.0762, True), (0.0703, 0.0743, True), (0.0683, 0.072, True), (0.0663, 0.069, True),
+    (0.0643, 0.0688, True), (0.0623, 0.0666, True), (0.0603, 0.0639, True), (0.0583, 0.0626, True),
+    (0.0563, 0.0611, True), (0.0543, 0.0589, True), (0.0523, 0.0565, True), (0.0503, 0.0543, True),
+    (0.0483, 0.0554, True), (0.0463, 0.0587, False), (0.0443, 0.0581, True), (0.0423, 0.058, True),
+]
+
+
+def test_contact_is_read_where_the_fingertips_stop_going_down_though_pressing_raises_their_reading():
+    verdicts = [probe._judge(MAKER_ROWS[:n]) for n in range(1, len(MAKER_ROWS) + 1)]
+    first = next(n for n, (verdict, _) in enumerate(verdicts) if verdict != "go")
+    assert verdicts[first][0] == "contact" and MAKER_ROWS[first][0] == 0.0483        # the first step on the table
+    assert verdicts[first][1] == pytest.approx(0.0549, abs=0.0005)

@@ -4,15 +4,17 @@ For each probe point the fingertips go above it with the gripper pointing down (
 jaws closed), then the fingertip target goes down STEP_M at a time at PROBE_SPEED_DEG_S. After each step, once its
 command has ended, the measured fingertip height is read twice, STILL_S apart, and set against the fingertip height
 the probe commanded. Contact: over the last STILL_STEPS steps the command went down while the measured fingertips
-moved less than STILL_M, they stand still, and they stand more than CONTACT_M above their command beyond the offset
-they held while descending freely over the first FREE_STEPS steps. A step the harness stops only because it ended
-short of its target (``ended_short``) is a reading like any other: the arm holds there and the next step's target
-is absolute; the harness runs the probe with a contact tolerance of SHORT_M, so the probe's own criteria, not a
-tighter tolerance set for other work, judge the steps on and near the table. Any other stop or fault ends the probe, as does falling more than PRESS_M behind without standing
-still. Lag closes once a command has ended, so it never passes; a support does not. The table there is the
-measured fingertip height. No target ever lies more than BELOW_CONTACT_M under the lowest fingertip height measured
-at that point, nor more than BELOW_M under the expected table at the point's own reach, and the harness it runs on
-has its table there, so its own floor refuses anything lower. The arm starts at rest with its motors cool and is rested at the end, also after a failure.
+went down less than STILL_M (pressed on a support, their reading may rise), they stood still, and they stand more
+than CONTACT_M above their command beyond the offset they held while descending freely over the first FREE_STEPS
+steps. The table there is the mean of those readings. A step the harness stops only because it ended short of its
+target (``ended_short``) is a reading like any other: the arm holds there and the next step's target is absolute.
+The harness runs the probe with a contact tolerance of SHORT_M, so the probe's own criteria, not a tighter
+tolerance set for other work, judge the steps on and near the table. Any other stop or fault ends the probe, as does
+falling more than PRESS_M behind without contact. Lag closes once a command has ended, so it never passes; a
+support does not. No target ever lies more than BELOW_CONTACT_M under the lowest fingertip height measured at that
+point, nor more than BELOW_M under the expected table at the point's own reach, and the harness it runs on has its
+table there, so its own floor refuses anything lower. The arm starts at rest with its motors cool and is rested at
+the end, also after a failure.
 """
 
 from __future__ import annotations
@@ -31,8 +33,8 @@ STEP_M = 0.002               # fingertip target step
 ABOVE_M = 0.06               # the descent starts this far above the expected table
 BELOW_M = 0.04               # and never commands the fingertips lower than this below it
 FREE_STEPS = 3               # steps that must descend freely to set the free offset
-STILL_STEPS = 3              # contact: over this many steps ...
-STILL_M = 0.001              # ... the measured fingertips moved less than this
+STILL_STEPS = 2              # contact: over this many steps ...
+STILL_M = 0.001              # ... the measured fingertips went down less than this
 CONTACT_M = 0.004            # ... and stand this far above their command beyond the free offset
 PRESS_M = 0.012              # further behind their command than this without contact ends the probe
 BELOW_CONTACT_M = 0.016      # no target lies further than this under the lowest measured fingertip height
@@ -126,21 +128,36 @@ def _probe_point(harness: Harness, arm: str, x: float, y: float, expect_z: float
                 raise CalibrationError(f"{arm}: the fingertips did not descend freely at the start of the probe at "
                                        f"({x:.3f}, {y:.3f}) (they stand near z = {rows[-1][1]:.3f} m): the table is "
                                        "higher than expected; give a higher --expect")
-        if len(rows) < FREE_STEPS + STILL_STEPS:
-            continue
-        free = float(np.median(offsets[:FREE_STEPS]))
-        if offsets[-1] - free > PRESS_M:
-            raise CalibrationError(f"{arm}: the fingertips at ({x:.3f}, {y:.3f}) fell {(offsets[-1] - free) * 1000:.0f} "
-                                   "mm behind their command without standing still; stopped before pressing harder")
-        last = rows[-STILL_STEPS:]
-        moved = max(m for _, m, _ in last) - min(m for _, m, _ in last)
-        if moved < STILL_M and all(still for _, _, still in last) and offsets[-1] - free > CONTACT_M:
-            z = float(np.mean([m for _, m, _ in last]))
+        verdict, value = _judge(rows)
+        if verdict == "press":
+            raise CalibrationError(f"{arm}: the fingertips at ({x:.3f}, {y:.3f}) fell {value * 1000:.0f} mm behind "
+                                   "their command without standing still; stopped before pressing harder")
+        if verdict == "contact":
+            free = float(np.median(offsets[:FREE_STEPS]))
             tip = harness.models[arm].fingertip(harness.backend.read()[arm].q)
-            say(f"{arm}: table at z = {z:.4f} m, {reach:.3f} m from the base (the fingertips stopped "
+            say(f"{arm}: table at z = {value:.4f} m, {reach:.3f} m from the base (the fingertips stopped "
                 f"{(offsets[-1] - free) * 1000:.1f} mm above their command, free offset {free * 1000:.1f} mm)")
             _expect_done(harness.step(_move(model, x, y, expect_z + ABOVE_M, pitch, yaw, arm)), "lift")
-            return reach, z, [round(float(v), 4) for v in tip]
+            return reach, value, [round(float(v), 4) for v in tip]
+
+
+def _judge(rows: Sequence[tuple[float, float, bool]]) -> tuple[str, float]:
+    """From the probe's readings so far, ``(commanded, measured fingertip z, stood still)`` per step: ("contact",
+    table z), ("press", how far behind their command beyond the free offset the fingertips fell), or ("go", 0).
+    Contact: over the last STILL_STEPS steps the fingertips went down less than STILL_M (pressed on, their reading
+    may rise), stood still after each, and the last stands more than CONTACT_M above its command beyond the free
+    offset; the table is the mean of those readings."""
+    if len(rows) < FREE_STEPS + STILL_STEPS:
+        return "go", 0.0
+    offsets = [m - c for c, m, _ in rows]
+    free = float(np.median(offsets[:FREE_STEPS]))
+    last = rows[-STILL_STEPS:]
+    fell = last[0][1] - min(m for _, m, _ in last)
+    if fell < STILL_M and all(still for _, _, still in last) and offsets[-1] - free > CONTACT_M:
+        return "contact", float(np.mean([m for _, m, _ in last]))
+    if offsets[-1] - free > PRESS_M:
+        return "press", offsets[-1] - free
+    return "go", 0.0
 
 
 def _lowest_target(model, limit_z: float) -> float:
