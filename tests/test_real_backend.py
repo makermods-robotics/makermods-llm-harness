@@ -490,3 +490,57 @@ def test_a_hold_returns_the_sdk_setpoint_and_waits_two_control_periods(rig):
     assert np.allclose(q, commanded[:6]) and -0.01 <= opening <= 1.01      # the measured opening, unclipped
     rate = backend.group["arm"].config.control_rate_hz
     assert backend.hold_settle_s == pytest.approx(2.0 / rate)
+
+
+def held_by_a_dead_program(kind="maker"):
+    """An arm with motors that cannot report torque state, left holding at home by a session that ended; its
+    joints then measure load, as a real arm carrying its weight does (the SDK simulator models none)."""
+    testing = importlib.import_module(f"{kind}_arm.testing")
+    first, sim = testing.simulated_arm(params_supported=False)
+    rest = np.array(sim.positions[:6])
+    model = ArmModel(ArmInfo("arm", kind))
+    first.connect()
+    first.enable()
+    assert first.move_to(list(model.home_q) + first.get_joint_positions()[6:], speed=3.0, timeout=10.0)
+    first.detach()
+    arm = importlib.import_module(f"{kind}_arm.arm").Arm(sim.config, first.backend)
+    real = arm.get_joint_torques
+    arm.get_joint_torques = lambda: [t + (1.4 if i == 1 else 0.0) for i, t in enumerate(real())]
+    return arm, sim, model, rest
+
+
+def test_an_old_firmware_arm_carrying_load_is_held_by_another_program_and_attach_takes_it_over():
+    arm, sim, model, rest = held_by_a_dead_program()
+    plain = RealBackend("maker", {}, {}, [ArmInfo("arm", "maker")], arms={"arm": arm}, rest_q={"arm": rest})
+    state = plain.read()["arm"]
+    assert state.enabled is True and "another program probably holds it" in state.fault
+    assert "--attach" in state.fault and "shoulder_lift +1.4" in state.fault
+    h = Harness.open(backend=plain, table_z=-0.5)
+    obs = h.step({"action": "home"})
+    assert obs.result.status == "fault" and "--attach" in obs.result.message        # nothing sent to it
+    held = np.array(sim.positions[:6])
+    h.close()
+    arm, sim, model, rest = held_by_a_dead_program()
+    backend = RealBackend("maker", {}, {}, [ArmInfo("arm", "maker")], arms={"arm": arm}, rest_q={"arm": rest},
+                          attach=True)
+    state = backend.read()["arm"]
+    assert state.enabled is True and state.fault is None
+    assert np.degrees(np.abs(np.array(sim.positions[:6]) - held)).max() < 0.05      # taken over where it held
+    h = Harness.open(backend=backend, table_z=float(model.lowest_z(rest)) - 0.10,
+                     safety=SafetyConfig(max_speed_deg_s=120, slow_speed_deg_s=40))
+    assert h.rest().result.ok
+    assert h.close() == {"arm": "released"}
+
+
+def test_an_enable_the_sdk_refuses_for_a_held_arm_names_attach(rig, monkeypatch):
+    backend, sim, _ = rig
+    kind = "maker" if "maker" in type(backend.group["arm"]).__module__ else "metal"
+    errors = importlib.import_module(f"{kind}_arm.errors")
+
+    def refuse(*args, **kwargs):
+        raise errors.HeldByAnotherProgram("motors 2 (shoulder_lift) are producing torque")
+    monkeypatch.setattr(backend.group["arm"], "enable", refuse)
+    h = Harness.open(backend=backend, table_z=-0.5)
+    obs = h.step({"action": "home"})
+    assert obs.result.status == "fault" and "another program holds this arm" in obs.result.message
+    assert "llm-harness serve --attach" in obs.result.message and f"{kind}-arm rest --arm arm" in obs.result.message
