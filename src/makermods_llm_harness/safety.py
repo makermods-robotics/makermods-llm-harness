@@ -441,9 +441,10 @@ class Envelope:
 
     def _check_floor(self, q_start, path, contact: bool = False) -> None:
         """Every waypoint's guarded clearance stays above the floor (``contact``: the hard floor less
-        ``contact_depth_m``). From under it (recovery), the clearance may never drop below the highest it has
-        reached (by more than RECOVERY_EPS_M on the way, at all at the end), and once a waypoint is above the floor
-        the rest stay there."""
+        ``contact_depth_m``). An arm already more than the contact allowance under the hard floor may not go lower
+        at all. From under the floor (recovery), the clearance may never drop below the highest it has reached (by
+        more than RECOVERY_EPS_M on the way, at all at the end), and once a waypoint is above the floor the rest
+        stay there."""
         name, floor = self.model.name, self.config.floor_margin_m - (self.config.contact_depth_m if contact else 0.0)
         kind = "floor of a move with until contact" if contact else "hard floor"
         guarded = self.guarded_clearance(np.vstack([q_start, path]))
@@ -456,6 +457,14 @@ class Envelope:
             raise MoveRejected(text.format(what=what, mm=nominal[t] * 1000, guarded=guarded[t] * 1000,
                                            floor=floor * 1000, start=nominal[0] * 1000))
 
+        held_under = self.config.floor_margin_m - self.config.contact_allowance_m
+        if nominal[0] < held_under and float(np.min(nominal[1:])) < nominal[0]:
+            refuse(int(np.argmin(nominal[1:])) + 1,
+                   f"{name}: the arm is {{start:.0f}} mm above the table, more than the "
+                   f"{self.config.contact_allowance_m * 1000:.0f} mm contact allowance under the hard floor, and that "
+                   "motion would take the {what} lower, to "
+                   "{mm:.0f} mm. From here only motions that do not go lower are allowed: lift first (for example "
+                   "nudge dxyz [0, 0, 0.02]).")
         if guarded[0] >= floor:
             t = int(np.argmin(guarded[1:])) + 1
             if guarded[t] < floor:

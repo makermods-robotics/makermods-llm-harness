@@ -597,3 +597,16 @@ def test_a_contact_move_may_aim_a_bounded_depth_under_a_correctly_stored_table(s
     assert deep.status == "rejected" and "floor of a move with until contact" in deep.message
     assert h.state().arms["arm"].clearance_m == pytest.approx(0.0, abs=0.003)     # it stopped on the table
     assert SafetyConfig().contact_depth_m == 0.025
+
+
+def test_repeated_contact_nudges_from_under_the_measured_limit_are_refused(sim_harness):
+    h = sim_harness()                                      # no surface: the arm would sink through the table
+    r = over_the_surface(h)
+    clearance = h.state().arms["arm"].clearance_m
+    assert r.nudge([0, 0, -(clearance + 0.020)], until="contact").status == "stopped"
+    held_at = h.state().arms["arm"].clearance_m            # held about 10 mm under the stored table
+    for _ in range(5):
+        result = r.nudge([0, 0, -0.003], until="contact")
+        assert result.status == "rejected" and "only motions that do not go lower" in result.message
+    assert h.state().arms["arm"].clearance_m >= held_at - 0.0005                     # no ratchet
+    assert r.nudge([0, 0, 0.02]).ok                                                  # lifting is allowed
