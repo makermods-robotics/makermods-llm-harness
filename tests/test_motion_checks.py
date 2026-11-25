@@ -432,9 +432,9 @@ def test_a_contact_move_may_aim_a_bounded_depth_under_a_correctly_stored_table(s
     clearance = h.state().arms["arm"].clearance_m
     plain = r.nudge([0, 0, -(clearance + 0.012)], dry_run=True)
     assert plain.status == "rejected" and "hard floor" in plain.message           # other moves: not under it
-    deep = r.nudge([0, 0, -(clearance + 0.020)], until="contact", dry_run=True)   # past the 15 mm contact depth
-    result = r.nudge([0, 0, -(clearance + 0.012)], until="contact")
+    deep = r.nudge([0, 0, -(clearance + 0.030)], until="contact", dry_run=True)   # past the 25 mm contact depth
+    result = r.nudge([0, 0, -(clearance + 0.020)], until="contact")
     assert result.status == "done" and result.contact is not None, result.message
     assert deep.status == "rejected" and "floor of a move with until contact" in deep.message
     assert h.state().arms["arm"].clearance_m == pytest.approx(0.0, abs=0.003)     # it stopped on the table
-    assert SafetyConfig().contact_depth_m == 0.015
+    assert SafetyConfig().contact_depth_m == 0.025

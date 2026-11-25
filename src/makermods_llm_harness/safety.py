@@ -139,7 +139,7 @@ LIMITS: dict[str, tuple[float, float]] = {
     "floor_margin_m": (0.0, 0.2), "max_excursion_deg": (1.0, 360.0), "max_temp_c": (20.0, 100.0),
     "tracking_tolerance_deg": (0.5, 30.0), "tracking_lag_s": (0.0, 0.5), "settle_s": (0.0, 5.0),
     "contact_tolerance_m": (0.001, 0.05), "floor_tolerance_deg": (0.0, 10.0), "sag_allowance_m": (0.0, 0.05),
-    "contact_allowance_m": (0.0, 0.05), "contact_depth_m": (0.0, 0.03), "rate_hz": (5.0, 200.0), "keep_out_margin_m": (0.0, 0.2),
+    "contact_allowance_m": (0.0, 0.05), "contact_depth_m": (0.0, 0.05), "rate_hz": (5.0, 200.0), "keep_out_margin_m": (0.0, 0.2),
     "finger_length_m": (0.0, 0.3), "jaw_half_width_m": (0.0, 0.3), "finger_margin_m": (0.0, 0.05),
 }
 
@@ -179,8 +179,9 @@ class SafetyConfig:
     # pressing on the table does not stop it).
     contact_allowance_m: float = 0.010
     # A move with until "contact" may aim this far under the hard floor (the table, by default), so that a
-    # descent onto a correctly stored table can end short of its target, on contact. Other moves may not.
-    contact_depth_m: float = 0.015
+    # descent onto a correctly stored table can end more than contact_tolerance_m short of its target, on
+    # contact, though the jaws and the fingertip margin reach below the fingertip centre. Other moves may not.
+    contact_depth_m: float = 0.025
     rate_hz: float = 25.0              # joint targets per second while moving
     keep_out_margin_m: float = 0.03    # planned paths keep every point along the arm this far from keep-out zones
     # Gripper geometry; None takes arm_model.GRIPPERS for the arm type. Measure them on the installed tool.
