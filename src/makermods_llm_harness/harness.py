@@ -638,15 +638,20 @@ class Harness:
         explains, up to SAG_ARRIVAL_TOL_M, is done with the miss in the message; any other miss is ``stopped``, and so
         is a move that ended more than the contact tolerance short along the approach, whatever the arrival
         tolerance. ``contact``: the move asked for contact; one that ended more than the contact tolerance short at
-        its last sample, or with a joint blocked short of its goal (``_BlockedShort``), is judged by
-        ``_contact_ending``."""
+        its last watched sample or at a fresh read now, or with a joint blocked short of its goal
+        (``_BlockedShort``), is judged by ``_contact_ending``."""
         model = self.models[name]
         blocked = isinstance(result, _BlockedShort)
         if contact and (result.ok or blocked):
             ending = self._ending.pop(name, None)
             last = None if ending is None or start is None else _shortfall(goal[:3, 3], start,
                                                                           model.tool_points(ending[1]))
-            if blocked or (last is not None and last > self.config.contact_tolerance_m):
+            with self._io:
+                now = self._dev.read()[name].q
+            fresh = None if start is None or not np.all(np.isfinite(now)) else _shortfall(goal[:3, 3], start,
+                                                                                       model.tool_points(now))
+            tolerance = self.config.contact_tolerance_m
+            if blocked or any(s is not None and s > tolerance for s in (last, fresh)):
                 return self._contact_ending(name, goal, result, ending, start)
         with self._io:
             state = self._dev.read()[name]

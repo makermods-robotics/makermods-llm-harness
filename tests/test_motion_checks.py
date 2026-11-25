@@ -638,3 +638,20 @@ def test_a_blocked_ending_resting_on_the_measured_table_beyond_its_last_reach_is
     table = per_reach(rested, -0.0015, (reach - 0.10, reach - 0.018))    # 1.5 mm over it, 18 mm short of its reach
     h2, result = side_slide(sim_harness, monkeypatch, table_z=table)
     assert result.status == "done" and result.contact is not None, result.message
+
+
+def test_a_contact_descent_that_rebounds_after_its_last_watched_sample_is_held(sim_harness, monkeypatch):
+    h = sim_harness(safety=SafetyConfig(contact_tolerance_m=0.004))
+    r = over_the_surface(h)
+    start = h.backend.read()["arm"].q.copy()
+    real = Harness._execute
+
+    def execute(self, *args, **kwargs):                  # after the last watched sample the arm springs back up
+        out = real(self, *args, **kwargs)
+        a = self.backend._arms["arm"]
+        a.q = a.q + (6.5 / 30) * (start - a.q)              # 6.5 mm of the 30 mm descent
+        return out
+    monkeypatch.setattr(Harness, "_execute", execute)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert result.status == "stopped" and result.contact is None, result.message
+    assert held(h)                                         # the descent target is no longer active
