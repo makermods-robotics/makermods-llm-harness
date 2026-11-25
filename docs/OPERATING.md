@@ -372,6 +372,10 @@ arm in turn:
 | `--motors-off` | state that the motors are off, for an arm whose motors do not report their torque (older RobStride firmware). Check by hand that the arm moves freely first; motors that report torque on are still refused. |
 | `--watch` | hands-free table touch: the reading is taken once the gripper has moved by more than 3 cm and then held still (within 3 mm) for 5 s; gives up after 8 minutes |
 | `--table-z Z` | store a known table height without opening the robot: the world-frame z (metres) where the fingertips touch the table. A value more than 0.5 m from the arm base's height is refused. |
+| `--powered` | the arm finds the table itself, from and back to its recorded rest pose: at three points straight ahead (0.25, 0.32, 0.39 m from the base; `--points X,Y ...` for others, clear of objects) the jaws close, the fingertips go above the point pointing down and then 2 mm at a time down to the table at 3 deg/s. Contact is a step after which the fingertips stood still more than 4 mm above their command (beyond the offset they held while descending freely); arm lag closes once a step ends, so it is not taken for contact. The fingertips are never sent more than 4 cm under `--expect Z` (default: the stored height, else the base's), and a table already above the start is refused. Stored as a table height per reach. Needs the rest pose recorded; refused with a motor at 50 C or more |
+
+On an arm whose model sees a flat table at a height that changes with the reach (a Maker arm: about 1 cm between
+0.26 and 0.40 m), measure it with `--powered`: the floor then follows the reach of each monitored point.
 
 When the recorded rest pose lies under the floor for the measured table (within the hard floor once tracking error
 and sag are allowed for), `calibrate` and `robot check` say so. That is allowed: the arm starts in recovery mode, where

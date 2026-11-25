@@ -36,8 +36,8 @@ from .harness import Harness
 from .log import (EpisodeLog, latest_run, new_run_dir, profile, profile_text, read_episode, recorded_robot, runs_dir,
                   summary)
 from .robot import RobotError, SIM_BACKENDS
-from .safety import (REST_TOLERANCE_DEG, CalibrationError, Envelope, load_calibration, measure_table, save_calibration,
-                     watch_for_touch)
+from .safety import (REST_TOLERANCE_DEG, CalibrationError, Envelope, Table, load_calibration, measure_table,
+                     save_calibration, watch_for_touch)
 from .session import AddressLock, Client, PrivateSession, Server, SessionError, default_address, ensure_free
 
 ACTION_OPS = ("observe", "move_tool", "nudge", "gripper", "move_joints", "home", "rest", "wait")
@@ -714,8 +714,50 @@ def cmd_calibrate(args) -> int:
             path = save_calibration(robot.name, arm, args.table_z, robot.setup(arm))
             print(f"{arm}: stored table z = {args.table_z:.4f} m (world frame) in {path}")
         return 0
+    if args.powered:
+        calibrate_powered(robot, arms, points=args.points, expect=args.expect, yes=args.yes)
+        return 0
+    if args.points or args.expect is not None:
+        raise CommandError("--points and --expect go with --powered")
     calibrate(robot, arms, watch=args.watch, table=not args.rest, yes=args.yes, motors_off=args.motors_off)
     return 0
+
+
+def calibrate_powered(robot: robots.Robot, arms: Sequence[str], points: Optional[Sequence[tuple]] = None,
+                      expect: Optional[float] = None, yes: bool = False, ask: Callable[[str], str] = input,
+                      say: Callable[[str], None] = print) -> dict[str, Table]:
+    """For each arm: the powered table calibration (``probe.probe_table``) at ``points`` (world x, y; default
+    straight ahead at three reaches), stored as a table per reach. ``expect``: roughly where the table is (world z;
+    default the stored height, else the arm base's); the fingertips are never sent lower than ``probe.BELOW_M``
+    under it. The arm must be at its recorded rest pose and ends there."""
+    from . import probe
+    stored = load_calibration(robot.name)
+    tables = {}
+    for arm in arms:
+        base_z = next(i for i in robot.arm_infos() if i.name == arm).base_xyz[2]
+        guess = expect if expect is not None else stored.get(arm, {}).get("table_z", base_z)
+        limit = guess - probe.BELOW_M
+        count = len(points or probe.DEFAULT_REACHES_M)
+        if not yes and ask(f"Arm {arm} will move on its own: down to the table at {count} points, slowly, the "
+                           f"fingertips never below z = {limit:.3f} m. Keep the workspace clear and a hand on the "
+                           "emergency stop. Go on? [y/N] ").strip().lower() not in ("y", "yes"):
+            raise CalibrationError(f"{arm}: not calibrated")
+        with Harness.open(robot, table_z={arm: limit}) as harness:
+            where = [tuple(p) for p in points] if points else probe.default_points(harness, arm)
+            found = probe.probe_table(harness, arm, where, guess, limit, say=say)
+            table = Table.measured([(reach, z) for reach, z, _ in found])
+            path = save_calibration(robot.name, arm, table, robot.setup(arm, harness.config))
+        say(f"{arm}: stored table {table.text()} in {path}")
+        tables[arm] = table
+    return tables
+
+
+def _point(text: str) -> tuple[float, float]:
+    try:
+        x, y = (float(v) for v in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"a probe point is X,Y in metres, got {text!r}") from None
+    return x, y
 
 
 # ── mcp / run ──
@@ -894,8 +936,17 @@ def build_parser() -> _Parser:
     how.add_argument("--table-z", type=float, metavar="Z",
                      help="store a known table height (world frame, metres) without opening the robot")
     how.add_argument("--rest", action="store_true", help="record only the folded rest pose, not the table")
+    how.add_argument("--powered", action="store_true",
+                     help="the arm finds the table itself: a slow guarded descent at a few reaches, from and back "
+                          "to its rest pose; stored as a table height per reach")
+    q.add_argument("--points", nargs="+", type=_point, metavar="X,Y",
+                   help="with --powered: probe points, world metres (default: straight ahead at 0.25, 0.32, 0.39 m)")
+    q.add_argument("--expect", type=float, metavar="Z",
+                   help="with --powered: roughly where the table is, world z (default: the stored height, else the "
+                        "arm base's); the fingertips never go more than 4 cm below it")
     q.add_argument("--yes", action="store_true",
-                   help="record the rest pose without asking whether the arm is folded and supported")
+                   help="record the rest pose without asking whether the arm is folded and supported (with "
+                        "--powered: start without asking)")
     q.add_argument("--motors-off", action="store_true",
                    help="state that the motors are off, for an arm whose motors do not report their torque")
     q.set_defaults(func=cmd_calibrate)

@@ -6,7 +6,8 @@ with recovery when the arm already sits under it, and the final approach to the 
 the rest pose is the lowest point of the path) and the per-tick speed, which drops to the slow speed
 whenever the path comes near the table, and keep-out boxes no point along the arm may enter (with the same
 kind of recovery for an arm that starts inside one). The table height is measured by touching it with the fingertips
-(``measure_table``) and stored per robot and arm, with the setup it was measured on.
+(``measure_table``, or the powered descent in ``probe``) and stored per robot and arm, with the setup it was measured
+on; measured at several reaches it is a ``Table`` whose height depends on the distance from the arm base.
 """
 
 from __future__ import annotations
