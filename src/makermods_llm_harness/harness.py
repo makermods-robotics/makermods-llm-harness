@@ -50,6 +50,7 @@ GRIP_HOLD_EPS = 0.01               # ... and the commanded gripper opening this 
 FRESH_HOLD_S = 0.25                # ... from feedback no older than this
 HOLD_WAIT_S = 10.0                 # longest wait for the harness before a hold after a failed queued action
 STILL_S = 0.3                      # elapsed window over which standing still is judged
+CONTACT_LATERAL_M = 0.010          # a contact ending lies this close to the planned tool path, or at the table
 COMMAND_MOVED_M = 0.001            # contact: while the command moves further than this over STILL_S (one lag
 CONTACT_RATIO = 0.25               # earlier), the tool point advances less than this fraction as far along it, for
                                    # STILL_S more; the shortfall then exceeds what it was while advancing freely
@@ -146,6 +147,7 @@ class Harness:
         self._released: dict[str, str] = {}               # backend.rest() outcome per arm, read by close()
         self._commanded: dict[str, tuple[np.ndarray, np.ndarray]] = {}   # tool pose and joints of the last done motion
         self._heading: dict[str, tuple[np.ndarray, Optional[np.ndarray]]] = {}   # end joints and pose of a motion
+        self._ending: dict[str, tuple] = {}     # a contact move's end: (stillness window, last q, planned tool path)
         self._closed = False
         if log:
             log.start(robot_name, list(self.models), self.cameras,
@@ -635,11 +637,17 @@ class Harness:
         tolerance. A miss that the joint ``standing`` error the arm held before the move (command minus measurement)
         explains, up to SAG_ARRIVAL_TOL_M, is done with the miss in the message; any other miss is ``stopped``, and so
         is a move that ended more than the contact tolerance short along the approach, whatever the arrival
-        tolerance. ``contact``: the move asked for contact; ending more than the contact tolerance short and standing
-        still over STILL_S (no stop request meanwhile, valid fresh feedback after it) is contact (``_on_contact``),
-        and short while still moving is ``stopped``. So is a contact move that ended with a joint blocked short of
-        its goal (``_BlockedShort``); any other such ending is held as ``stopped``."""
+        tolerance. ``contact``: the move asked for contact; one that ended more than the contact tolerance short at
+        its last sample, or with a joint blocked short of its goal (``_BlockedShort``), is judged by
+        ``_contact_ending``."""
         model = self.models[name]
+        blocked = isinstance(result, _BlockedShort)
+        if contact and (result.ok or blocked):
+            ending = self._ending.pop(name, None)
+            last = None if ending is None or start is None else _shortfall(goal[:3, 3], start,
+                                                                          model.tool_points(ending[1]))
+            if blocked or (last is not None and last > self.config.contact_tolerance_m):
+                return self._contact_ending(name, goal, result, ending, start)
         with self._io:
             state = self._dev.read()[name]
             ages = self._dev.feedback_ages(name)
@@ -659,31 +667,6 @@ class Harness:
         if short is not None:
             result.error["short_m"] = round(short, 4)
         tolerance = self.config.contact_tolerance_m
-        blocked = isinstance(result, _BlockedShort)
-        if (result.ok or blocked) and contact and short is not None and short > tolerance:
-            time.sleep(STILL_S)
-            with self._gate, self._io:                # a stop either came first (seen here) or holds after this read
-                stopped = self._abort is not None and self._abort.is_set()
-                later = self._dev.read()[name]
-                ages = self._dev.feedback_ages(name)
-            if stopped:
-                return self._hold(name, f"{name}: stopped on request; the arm holds where it is.")
-            fresh = ages is None or all(age is not None and math.isfinite(age) and age <= FRESH_HOLD_S for age in ages)
-            if later.fault or later.enabled is not True or not np.all(np.isfinite(later.q)) or not fresh:
-                return self._hold(name, f"{name}: the feedback after the move is not valid ("
-                                        f"{later.fault or 'torque state or fresh feedback missing'}).", "fault")
-            moved = float(np.linalg.norm(model.tool_points(later.q) - model.tool_points(state.q)))
-            if moved < COMMAND_MOVED_M:
-                return self._on_contact(name, goal, later.q, result.error, at_end=True)
-            held = self._hold(name, result.message if blocked else
-                              f"{name}: ended {short * 1000:.0f} mm short of the target along the approach and was "
-                              "still moving. The arm holds where it is; look at the cameras.")
-            held.error = result.error
-            return held
-        if blocked:
-            held = self._hold(name, result.message)
-            held.error = result.error
-            return held
         if result.ok and not contact and short is not None and short > tolerance:
             held = self._hold(name, f"{name}: ended {short * 1000:.0f} mm short of the target along the approach "
                                     f"({position * 1000:.0f} mm and {math.degrees(angle):.1f} deg from it). It may "
@@ -707,6 +690,69 @@ class Harness:
         if result.ok and contact:
             result.message = f"{name}: reached the target without contact."
         return result
+
+    def _contact_ending(self, name: str, goal: np.ndarray, result: Result, ending: Optional[tuple],
+                        start: Optional[np.ndarray]) -> Result:
+        """A contact move's end, held first: under the stop gate (a stop either came first, and wins, or waits for
+        this result) the arm is held, read, and judged. Contact (done) when the samples taken under the watch show
+        the tool point still over STILL_S (moving less than COMMAND_MOVED_M, also up to the held reading), the held
+        reading is more than the contact tolerance short along the approach, and the tool point is within
+        CONTACT_LATERAL_M of the planned tool path or the arm's lowest point is at the table (within the contact
+        tolerance above it: resting on the known surface explains a slide along it). Anything else is ``stopped``;
+        too few samples to tell, too."""
+        model, env, tol = self.models[name], self.envelopes[name], self.config.contact_tolerance_m
+        blocked = isinstance(result, _BlockedShort)
+        window, _, planned = ending if ending is not None else (None, None, None)
+        with self._gate:
+            if self._abort is not None and self._abort.is_set():
+                return self._hold(name, f"{name}: stopped on request; the arm holds where it is.")
+            held = self._hold(name, result.message if blocked else f"{name}: the move ended.")
+            if held.status != "stopped":
+                return held
+            with self._io:
+                state = self._dev.read()[name]
+                ages = self._dev.feedback_ages(name)
+            fresh = ages is None or all(age is not None and math.isfinite(age) and age <= FRESH_HOLD_S for age in ages)
+            if state.fault or state.enabled is not True or not np.all(np.isfinite(state.q)) or not fresh:
+                return Result("fault", f"{name}: the feedback after the hold is not valid ("
+                                       f"{state.fault or 'torque state or fresh feedback missing'}).")
+            xyz = model.tool_points(state.q)
+            position, angle = pose_error(model.tool_pose(state.q), goal)
+            short = None if start is None else _shortfall(goal[:3, 3], start, xyz)
+            error = {"position_m": round(position, 4), "angle_deg": round(math.degrees(angle), 1)}
+            if short is not None:
+                error["short_m"] = round(short, 4)
+            lateral = math.inf if planned is None else _path_distance(planned, xyz)
+            clearance = float(env.clearance(state.q))
+            if window is None:
+                why = f"too few samples after the command ended to tell whether it stood still over {STILL_S:g} s"
+            else:
+                q_past, q_last, span = window
+                moved = max(float(np.linalg.norm(model.tool_points(q_last) - model.tool_points(q_past))),
+                            float(np.linalg.norm(xyz - model.tool_points(q_last))))
+                if moved >= COMMAND_MOVED_M:
+                    why = f"was still moving ({moved * 1000:.1f} mm over {span:.2f} s)"
+                elif short is None or short <= tol:
+                    why = (f"ended {0.0 if short is None else short * 1000:.1f} mm short of the target, within the "
+                           f"{tol * 1000:.0f} mm contact tolerance")
+                elif lateral > CONTACT_LATERAL_M and clearance > tol:
+                    why = (f"ended {lateral * 1000:.0f} mm to the side of its path and {clearance * 1000:.0f} mm above "
+                           "the table: not a contact along its approach")
+                else:
+                    why = None
+            if why is None:
+                reach = float(np.linalg.norm(goal[:3, 3] - xyz))
+                where = ", ".join(f"{v:.3f}" for v in xyz)
+                out = Result("done", f"{name}: stopped on contact at the end of the move {reach * 1000:.0f} mm short "
+                                     f"of the target, tool point at [{where}] m; the arm holds there.")
+                out.contact = {"xyz": [round(float(v), 4) for v in xyz], "short_m": round(reach, 4)}
+            elif blocked:
+                out = Result("stopped", f"{result.message} Not a contact: it {why}.")
+            else:
+                out = Result("stopped", f"{name}: the move ended short of its target and {why}. The arm holds where "
+                                        "it is; look at the cameras.")
+            out.error = error
+            return out
 
     def _on_contact(self, name: str, goal: np.ndarray, q: np.ndarray, error: Optional[dict] = None,
                     at_end: bool = False) -> Result:
@@ -943,6 +989,7 @@ class Harness:
         advancing freely (load changes and lag). A shortfall still there once the command has ended is judged by
         ``_arrival``."""
         model, env, cfg = self.models[name], self.envelopes[name], self.config
+        self._ending.pop(name, None)
         start_command = q0 if start_command is None else np.asarray(start_command, dtype=float)
         floor = min(env.hold_floor(q0), math.inf if floor is None else floor)
         zones = env.keep_out_hold(q0, path[-1] if rest else None)
@@ -961,7 +1008,7 @@ class Harness:
         tools = None if tool is None else np.empty((len(ext), 3))
         if tools is not None:
             tools[0] = model.tool_points(q0)
-        clock, first, following, state, settling = 0.0, 0, False, None, None
+        clock, first, following, state, settling, last = 0.0, 0, False, None, None, 0
         slow_since, free_short = None, 0.0
         tick_end = time.monotonic()
         for t in range(len(ext) - 1):
@@ -983,6 +1030,7 @@ class Harness:
             clock += max(self._dt, now - tick_end)
             tick_end = now
             measured[t + 1], seen[t + 1] = state.q, clock
+            last = t + 1
             if tools is None:
                 continue
             tools[t + 1] = model.tool_points(state.q)
@@ -1015,6 +1063,9 @@ class Harness:
                                         f"{cfg.tracking_lag_s:g} s"
                                         + (", and the arm never followed its command" if not following else "")
                                         + "). The arm holds where it is; look at the cameras.")
+        if contact_goal is not None:
+            self._ending[name] = (self._still_window(measured, seen, last), measured[last].copy(),
+                                  tool[:len(path) + 1].copy())
         verdict = judge_motion(goal, q0, start_command, state.q, env.tolerance,
                                held=held, requested=requested)
         if verdict is None:
@@ -1033,6 +1084,15 @@ class Harness:
         if kind == "short" and contact_goal is not None:
             return _BlockedShort("stopped", f"{name}: {what}. The arm holds where it is; look at the cameras.")
         return self._hold(name, f"{name}: {what}. The arm holds where it is; look at the cameras.")
+
+    @staticmethod
+    def _still_window(measured: np.ndarray, seen: np.ndarray, last: int) -> Optional[tuple]:
+        """The joints measured at the last tick and the latest earlier tick at least STILL_S before it, and the
+        elapsed time between: ``(q_past, q_last, span)``; None when the samples span less than STILL_S."""
+        past = int(np.searchsorted(seen[:last + 1], seen[last] - STILL_S, side="right")) - 1
+        if past < 0 or seen[last] - seen[past] < STILL_S:
+            return None
+        return measured[past].copy(), measured[last].copy(), float(seen[last] - seen[past])
 
     @staticmethod
     def _joints_still(measured: np.ndarray, seen: np.ndarray, last: int, now: float) -> bool:
@@ -1497,6 +1557,17 @@ def _pose_action(pose, arm: Optional[str], line: bool) -> MoveTool:
     else:
         raw = {"xyz": pose.tolist() if isinstance(pose, np.ndarray) else pose}
     return parse_action({"action": "move_tool", **raw, "arm": arm, "line": bool(line)})
+
+
+def _path_distance(path: np.ndarray, point: np.ndarray) -> float:
+    """How far ``point`` lies from the polyline ``path`` (N, 3)."""
+    path, point = np.asarray(path, dtype=float), np.asarray(point, dtype=float)
+    if len(path) == 1:
+        return float(np.linalg.norm(point - path[0]))
+    a, b = path[:-1], path[1:]
+    ab = b - a
+    t = np.clip(np.einsum("ij,ij->i", point - a, ab) / np.maximum(np.einsum("ij,ij->i", ab, ab), 1e-18), 0.0, 1.0)
+    return float(np.min(np.linalg.norm(point - (a + t[:, None] * ab), axis=1)))
 
 
 def _shortfall(goal: np.ndarray, start: np.ndarray, end: np.ndarray) -> Optional[float]:

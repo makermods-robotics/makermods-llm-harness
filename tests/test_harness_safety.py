@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from makermods_llm_harness import HarnessClosed
+from makermods_llm_harness.harness import Harness
 from makermods_llm_harness.backends.base import Frame
 from makermods_llm_harness.backends.sim import SimBackend
 from makermods_llm_harness.log import EpisodeLog, read_episode
@@ -250,10 +251,16 @@ def test_a_descent_that_ends_short_along_its_approach_is_stopped_with_the_shortf
 
 
 def test_until_contact_that_ends_short_and_still_is_contact(sim_harness):
-    h = sim_harness(backend=Sag(sim_backend().arms))
-    assert_done(h.step({"action": "home"}))
-    sagging(h, 0.018)
-    obs = h.step({"action": "nudge", "dxyz": [0, 0, -0.05], "until": "contact"})
+    def descend(**kwargs):
+        h = sim_harness(backend=Sag(sim_backend().arms), **kwargs)
+        assert_done(h.step({"action": "home"}))
+        sagging(h, 0.018)
+        return h, h.step({"action": "nudge", "dxyz": [0, 0, -0.05], "until": "contact"})
+
+    h, obs = descend()                                   # it stops short in the air, its tool point swung aside:
+    assert obs.result.status == "stopped" and "to the side of its path" in obs.result.message     # not contact
+    rested = h.state().arms["arm"].clearance_m + h.envelopes["arm"].table_z
+    h, obs = descend(table_z=rested - 0.002)              # the same ending resting on the stored table: contact
     assert_done(obs)
     assert obs.result.contact is not None and "stopped on contact at the end of the move" in obs.result.message
     assert obs.result.error["short_m"] == pytest.approx(0.018, abs=0.004)     # along the approach
@@ -425,14 +432,13 @@ def test_a_stop_during_the_final_contact_check_is_not_contact(sim_harness, monke
     h = sim_harness(backend=Sag(sim_backend().arms))
     assert_done(h.step({"action": "home"}))
     sagging(h, 0.018)
-    real_sleep = time.sleep
+    real = Harness._arrival
 
-    def sleep(seconds):
-        if seconds == harness_module.STILL_S:              # the final contact check: an operator stop lands here
-            stopper = threading.Thread(target=h.stop)
-            stopper.start()
-            stopper.join(10)
-        real_sleep(seconds)
-    monkeypatch.setattr(harness_module.time, "sleep", sleep)
+    def arrival(self, *args, **kwargs):                    # an operator stop lands as the move ends
+        stopper = threading.Thread(target=self.stop)
+        stopper.start()
+        stopper.join(10)
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(Harness, "_arrival", arrival)
     obs = h.step({"action": "nudge", "dxyz": [0, 0, -0.05], "until": "contact"})
     assert obs.result.status == "stopped" and obs.result.contact is None and "on request" in obs.result.message

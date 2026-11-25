@@ -127,7 +127,9 @@ kernel.queue([grasp, lift])
   error and drops what waits behind it. A check at the top of an action (`raise`) stops it before it moves.
 - `until="contact"` ends a move or nudge early, holding, where the measured arm stops following its command; the
   result says so (`result.contact["xyz"]`, `result.contact["short_m"]`). It also ends there, as contact, when the
-  arm stands still short of the target once the command has ended, also with a joint blocked short of its goal.
+  arm stands still short of the target once the command has ended, also with a joint blocked short of its goal:
+  then only more than 10 mm short, standing still, and on its path (within 10 mm) or resting on the table;
+  otherwise it ends stopped, held, and the message says why.
   Such a move may aim up to 25 mm under the table (`contact_depth_m`): aim about 2 cm under the surface you expect
   to touch, more than the 10 mm contact tolerance. Use it instead of stepping down a centimetre at a time. A plain move that ends more than 10 mm short of its target along the approach raises `MotionFailed`
   (stopped); `result.error["short_m"]` says by how much.
