@@ -133,3 +133,26 @@ def test_powered_needs_its_own_options_and_asks_first(bench, monkeypatch, capsys
     with pytest.raises(CalibrationError, match="not calibrated"):
         cli.calibrate_powered(robots.load("bench"), ["left"], points=POINTS[:1], expect=0.05, ask=lambda p: "n",
                               say=lambda s: None)
+
+
+def test_a_probe_step_stopped_short_is_a_reading_not_a_failure(bench, monkeypatch):
+    from makermods_llm_harness.harness import Harness
+    real = Harness.step
+    stopped = []
+
+    def step(self, action, *args, **kwargs):          # as a real arm whose free offset is large: steps resting on
+        obs = real(self, action, *args, **kwargs)      # the table end stopped, short of their target
+        short = (obs.result.error or {}).get("short_m")
+        if isinstance(action, dict) and action.get("speed_deg_s") == probe.PROBE_SPEED_DEG_S and obs.result.ok \
+                and short is not None and short > 0.003:
+            obs.result.status, obs.result.message = "stopped", "arm: ended short of the target along the approach"
+            stopped.append(short)
+        return obs
+    monkeypatch.setattr(Harness, "step", step)
+    cli.calibrate_powered(robots.load("bench"), ["left"], points=POINTS[:2], expect=0.05, yes=True, say=lambda s: None)
+    assert stopped
+    measured = dict(load_calibration("bench")["left"]["table_reach"])
+    for (x, y) in POINTS[:2]:
+        reach = math.hypot(x, y)
+        z = min(measured.items(), key=lambda kv: abs(kv[0] - reach))[1]
+        assert z == pytest.approx(table_at(reach), abs=0.003)

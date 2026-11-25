@@ -5,7 +5,9 @@ jaws closed), then the fingertip target goes down STEP_M at a time at PROBE_SPEE
 command has ended, the measured fingertip height is read twice, STILL_S apart. Contact: over the last STILL_STEPS
 steps the command went down while the measured fingertips moved less than STILL_M, they stand still, and they stand
 more than CONTACT_M above their command beyond the offset they held while descending freely over the first
-FREE_STEPS steps. Lag closes once a command has ended, so it never passes; a support does not. The table there is
+FREE_STEPS steps. A step the harness stops as ending short of its target is a reading like any other (the arm
+holds there and the next step's target is absolute); falling more than PRESS_M behind without standing still ends
+the probe. Lag closes once a command has ended, so it never passes; a support does not. The table there is
 the measured fingertip height. The descent never commands the fingertips lower than ``limit_z``, and the harness it
 runs on has its table at ``limit_z``, so its own floor refuses anything lower. The arm starts at rest with its
 motors cool and is rested at the end, also after a failure.
@@ -30,6 +32,7 @@ FREE_STEPS = 3               # steps that must descend freely to set the free of
 STILL_STEPS = 3              # contact: over this many steps ...
 STILL_M = 0.001              # ... the measured fingertips moved less than this
 CONTACT_M = 0.004            # ... and stand this far above their command beyond the free offset
+PRESS_M = 0.012              # further behind their command than this without contact ends the probe
 FREE_FRACTION = 0.5          # free descent: the measured fingertips follow at least this fraction of the command
 STILL_S = 0.3                # the second reading after a step, to see the fingertips stand still
 PROBE_SPEED_DEG_S = 3.0
@@ -94,7 +97,8 @@ def _probe_point(harness: Harness, arm: str, x: float, y: float, expect_z: float
             raise CalibrationError(f"{arm}: no table found at ({x:.3f}, {y:.3f}) down to fingertip z = "
                                    f"{limit_z:.3f} m; give a lower --expect if the table is lower")
         result = harness.step(_move(model, x, y, target, pitch, yaw, arm, PROBE_SPEED_DEG_S)).result
-        if result.status in ("fault", "rejected"):
+        short = result.status == "stopped" and (result.error or {}).get("short_m") is not None
+        if result.status in ("fault", "rejected") or (result.status == "stopped" and not short):
             raise CalibrationError(f"{arm}: probe step at fingertip z = {target:.3f} m: {result.status}: "
                                    f"{result.message}")
         rows.append(_fingertips(harness, arm))
@@ -108,6 +112,9 @@ def _probe_point(harness: Harness, arm: str, x: float, y: float, expect_z: float
         if len(rows) < FREE_STEPS + STILL_STEPS:
             continue
         free = float(np.median(offsets[:FREE_STEPS]))
+        if offsets[-1] - free > PRESS_M:
+            raise CalibrationError(f"{arm}: the fingertips at ({x:.3f}, {y:.3f}) fell {(offsets[-1] - free) * 1000:.0f} "
+                                   "mm behind their command without standing still; stopped before pressing harder")
         last = rows[-STILL_STEPS:]
         moved = max(m for _, m, _ in last) - min(m for _, m, _ in last)
         if moved < STILL_M and all(still for _, _, still in last) and offsets[-1] - free > CONTACT_M:
@@ -117,9 +124,6 @@ def _probe_point(harness: Harness, arm: str, x: float, y: float, expect_z: float
                 f"{(offsets[-1] - free) * 1000:.1f} mm above their command, free offset {free * 1000:.1f} mm)")
             _expect_done(harness.step(_move(model, x, y, expect_z + ABOVE_M, pitch, yaw, arm)), "lift")
             return reach, z, [round(float(v), 4) for v in tip]
-        if result.status == "stopped":
-            raise CalibrationError(f"{arm}: probe step at fingertip z = {target:.3f} m stopped without a clear "
-                                   f"contact: {result.message}")
 
 
 def _lowest_target(model, limit_z: float) -> float:
