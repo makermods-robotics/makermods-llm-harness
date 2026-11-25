@@ -7,7 +7,8 @@ the probe commanded. Contact: over the last STILL_STEPS steps the command went d
 moved less than STILL_M, they stand still, and they stand more than CONTACT_M above their command beyond the offset
 they held while descending freely over the first FREE_STEPS steps. A step the harness stops only because it ended
 short of its target (``ended_short``) is a reading like any other: the arm holds there and the next step's target
-is absolute. Any other stop or fault ends the probe, as does falling more than PRESS_M behind without standing
+is absolute; the harness runs the probe with a contact tolerance of SHORT_M, so the probe's own criteria, not a
+tighter tolerance set for other work, judge the steps on and near the table. Any other stop or fault ends the probe, as does falling more than PRESS_M behind without standing
 still. Lag closes once a command has ended, so it never passes; a support does not. The table there is the
 measured fingertip height. No target ever lies more than BELOW_CONTACT_M under the lowest fingertip height measured
 at that point, nor more than BELOW_M under the expected table at the point's own reach, and the harness it runs on
@@ -35,6 +36,7 @@ STILL_M = 0.001              # ... the measured fingertips moved less than this
 CONTACT_M = 0.004            # ... and stand this far above their command beyond the free offset
 PRESS_M = 0.012              # further behind their command than this without contact ends the probe
 BELOW_CONTACT_M = 0.016      # no target lies further than this under the lowest measured fingertip height
+SHORT_M = 0.010              # the harness's contact tolerance during the probe: a step ending further short is held
 FREE_FRACTION = 0.5          # free descent: the measured fingertips follow at least this fraction of the command
 STILL_S = 0.3                # the second reading after a step, to see the fingertips stand still
 PROBE_SPEED_DEG_S = 3.0

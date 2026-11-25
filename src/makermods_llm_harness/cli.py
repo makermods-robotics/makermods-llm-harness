@@ -36,8 +36,8 @@ from .harness import Harness
 from .log import (EpisodeLog, latest_run, new_run_dir, profile, profile_text, read_episode, recorded_robot, runs_dir,
                   summary)
 from .robot import RobotError, SIM_BACKENDS
-from .safety import (REST_TOLERANCE_DEG, CalibrationError, Envelope, Table, load_calibration, measure_table,
-                     save_calibration, table as stored_table, watch_for_touch)
+from .safety import (REST_TOLERANCE_DEG, CalibrationError, Envelope, SafetyConfig, Table, load_calibration,
+                     measure_table, save_calibration, table as stored_table, watch_for_touch)
 from .session import AddressLock, Client, PrivateSession, Server, SessionError, default_address, ensure_free
 
 ACTION_OPS = ("observe", "move_tool", "nudge", "gripper", "move_joints", "home", "rest", "wait")
@@ -749,7 +749,8 @@ def calibrate_powered(robot: robots.Robot, arms: Sequence[str], points: Optional
                            f"({expected.text()}). Keep the workspace clear and a hand on the emergency stop. Go on? "
                            "[y/N] ").strip().lower() not in ("y", "yes"):
             raise CalibrationError(f"{arm}: not calibrated")
-        with Harness.open(robot, table_z={arm: limit}) as harness:
+        safety = dataclasses.replace(SafetyConfig.from_dict(robot.safety), contact_tolerance_m=probe.SHORT_M)
+        with Harness.open(robot, table_z={arm: limit}, safety=safety) as harness:
             where = [tuple(p) for p in points] if points else probe.default_points(harness, arm)
             found = probe.probe_table(harness, arm, where, expected, say=say)
             measured = Table.measured([(reach, z) for reach, z, _ in found])

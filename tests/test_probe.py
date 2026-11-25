@@ -241,3 +241,18 @@ def test_a_stored_table_per_reach_sets_the_expectation_and_limit_at_each_points_
         assert expect_z == pytest.approx(want) and limit_z == pytest.approx(want - probe.BELOW_M)
         assert floor == pytest.approx(limit_z)
     assert seen[1][2] > stored.z - probe.BELOW_M + 0.01                 # far out: well above the mean's limit
+
+
+def test_the_probe_judges_its_steps_with_its_own_contact_tolerance(bench, monkeypatch):
+    robot = robots.load("bench")
+    robot.safety = dict(robot.safety or {}, contact_tolerance_m=0.003)      # tighter, set for other work
+    robots.save(robot)
+    real, seen = probe._probe_point, []
+
+    def probe_point(harness, arm, *args):
+        seen.append(harness.config.contact_tolerance_m)
+        return real(harness, arm, *args)
+    monkeypatch.setattr(probe, "_probe_point", probe_point)
+    cli.calibrate_powered(robots.load("bench"), ["left"], points=POINTS[:1], expect=0.05, yes=True,
+                          say=lambda s: None)
+    assert seen == [0.010] and probe.SHORT_M == 0.010
