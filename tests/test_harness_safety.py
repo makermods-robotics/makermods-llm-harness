@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from makermods_llm_harness import HarnessClosed
+from makermods_llm_harness.harness import Harness
 from makermods_llm_harness.backends.base import Frame
 from makermods_llm_harness.backends.sim import SimBackend
 from makermods_llm_harness.log import EpisodeLog, read_episode
@@ -203,13 +204,66 @@ def test_a_tool_move_reports_how_far_off_its_target_it_ended(sim_harness):
     assert_done(h.step({"action": "home"}))
     obs = h.step(move((0.31, 0, 0.54), -5))
     assert_done(obs)
-    assert obs.result.error == {"position_m": 0.0, "angle_deg": 1.5}
+    assert obs.result.error == {"position_m": 0.0, "angle_deg": 1.5, "short_m": 0.0}
     h = sim_harness(backend=type("Far", (Offset,), {"offset": math.radians(4)})(sim_backend().arms))
     assert_done(h.step({"action": "home"}))                    # the 4 deg it stands off its command stays put
     obs = h.step(move((0.31, 0, 0.54), -5))
     assert_done(obs)
-    assert obs.result.error == {"position_m": 0.0, "angle_deg": 4.0}
+    assert obs.result.error == {"position_m": 0.0, "angle_deg": 4.0, "short_m": 0.0}
     assert "ended 0 mm and 4.0 deg from the target" in obs.result.message
+
+
+class Sag(SimBackend):
+    """Reports shoulder_lift ``offset`` rad away from where the simulated joint is, once the arm is on: a standing
+    error that leaves the measured tool point above its command."""
+    offset = 0.0
+
+    def read(self):
+        states = super().read()
+        for state in states.values():
+            if state.enabled:
+                state.q = state.q.copy()
+                state.q[1] += self.offset
+        return states
+
+
+def sagging(h, height_m):
+    """Set the Sag backend's offset so the measured tool point at home stands about ``height_m`` above its command."""
+    model = h.models["arm"]
+    q = model.home_q.copy()
+    q[1] += 1e-3
+    rise = (model.tool_points(q)[2] - model.tool_points(model.home_q)[2]) / 1e-3
+    h.backend.offset = height_m / rise
+
+
+def test_a_descent_that_ends_short_along_its_approach_is_stopped_with_the_shortfall(sim_harness):
+    h = sim_harness(backend=Sag(sim_backend().arms))
+    assert_done(h.step({"action": "home"}))
+    sagging(h, 0.018)
+    obs = h.step({"action": "nudge", "dxyz": [0, 0, -0.05]})
+    assert obs.result.status == "stopped" and "short of the target along the approach" in obs.result.message
+    assert obs.result.error["short_m"] == pytest.approx(0.018, abs=0.004)
+    sagging(h, 0.006)                                           # within the contact tolerance: done, as before
+    assert_done(h.step({"action": "home"}))
+    obs = h.step({"action": "nudge", "dxyz": [0, 0, -0.05]})
+    assert_done(obs)
+    assert obs.result.error["short_m"] == pytest.approx(0.006, abs=0.003)
+
+
+def test_until_contact_that_ends_short_and_still_is_contact(sim_harness):
+    def descend(**kwargs):
+        h = sim_harness(backend=Sag(sim_backend().arms), **kwargs)
+        assert_done(h.step({"action": "home"}))
+        sagging(h, 0.018)
+        return h, h.step({"action": "nudge", "dxyz": [0, 0, -0.05], "until": "contact"})
+
+    h, obs = descend()                                   # it stops short in the air, its tool point swung aside:
+    assert obs.result.status == "stopped" and "to the side of its path" in obs.result.message     # not contact
+    rested = h.state().arms["arm"].clearance_m + h.envelopes["arm"].table_z
+    h, obs = descend(table_z=rested - 0.002)              # the same ending resting on the stored table: contact
+    assert_done(obs)
+    assert obs.result.contact is not None and "stopped on contact at the end of the move" in obs.result.message
+    assert obs.result.error["short_m"] == pytest.approx(0.018, abs=0.004)     # along the approach
 
 
 def test_a_nudge_starts_from_the_commanded_pose_until_the_arm_is_held_elsewhere(sim_harness):
@@ -349,3 +403,42 @@ def test_a_full_disk_is_reported_in_the_reply(sim_harness, tmp_path, monkeypatch
     assert obs.result.status == "rejected" and "nothing moved" in obs.result.message
     assert not obs.arms["arm"].enabled
     monkeypatch.undo()
+
+
+def test_maker_jaws_do_not_open_at_the_rest_pose(sim_harness):
+    h = sim_harness(arm="maker")
+    obs = h.step({"action": "gripper", "opening": 1.0})
+    assert obs.result.status == "rejected" and "cannot open at the rest pose" in obs.result.message
+    assert not h.backend.read()["arm"].enabled                              # refused before the motors came on
+    assert h.check({"action": "gripper", "opening": 1.0}).status == "rejected"
+    assert_done(h.step({"action": "gripper", "opening": 0.0}))              # closing is fine
+    assert_done(h.step({"action": "home"}))
+    assert_done(h.step({"action": "gripper", "opening": 1.0}))
+    metal = sim_harness(arm="metal")
+    assert_done(metal.step({"action": "gripper", "opening": 1.0}))          # its jaws open at rest
+
+
+def test_a_tighter_contact_tolerance_stops_a_move_short_within_the_arrival_tolerance(sim_harness):
+    from makermods_llm_harness import SafetyConfig
+    h = sim_harness(backend=Sag(sim_backend().arms), safety=SafetyConfig(contact_tolerance_m=0.003))
+    assert_done(h.step({"action": "home"}))
+    sagging(h, 0.006)                                     # 6 mm: inside the 10 mm arrival tolerance
+    obs = h.step({"action": "nudge", "dxyz": [0, 0, -0.05]})
+    assert obs.result.status == "stopped" and "short of the target along the approach" in obs.result.message
+    assert obs.result.error["short_m"] == pytest.approx(0.006, abs=0.003)
+
+
+def test_a_stop_during_the_final_contact_check_is_not_contact(sim_harness, monkeypatch):
+    h = sim_harness(backend=Sag(sim_backend().arms))
+    assert_done(h.step({"action": "home"}))
+    sagging(h, 0.018)
+    real = Harness._arrival
+
+    def arrival(self, *args, **kwargs):                    # an operator stop lands as the move ends
+        stopper = threading.Thread(target=self.stop)
+        stopper.start()
+        stopper.join(10)
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(Harness, "_arrival", arrival)
+    obs = h.step({"action": "nudge", "dxyz": [0, 0, -0.05], "until": "contact"})
+    assert obs.result.status == "stopped" and obs.result.contact is None and "on request" in obs.result.message

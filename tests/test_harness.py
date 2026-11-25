@@ -53,8 +53,8 @@ def test_every_target_sent_was_checked_or_is_a_hold_or_gripper_command(sim_harne
     checked = []
     original = Envelope.check
 
-    def recording_check(self, q_start, path, capped=True, rest_q=None):
-        original(self, q_start, path, capped, rest_q)
+    def recording_check(self, q_start, path, capped=True, rest_q=None, contact=False):
+        original(self, q_start, path, capped, rest_q, contact)
         checked.extend(np.asarray(path))
 
     monkeypatch.setattr(Envelope, "check", recording_check)
@@ -472,8 +472,8 @@ def recording(monkeypatch, base_cls=SimBackend):
     checked, sent = [], []
     original = Envelope.check
 
-    def recording_check(self, q_start, path, capped=True, rest_q=None):
-        original(self, q_start, path, capped, rest_q)
+    def recording_check(self, q_start, path, capped=True, rest_q=None, contact=False):
+        original(self, q_start, path, capped, rest_q, contact)
         checked.extend(np.asarray(path))
 
     monkeypatch.setattr(Envelope, "check", recording_check)

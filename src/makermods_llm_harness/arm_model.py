@@ -32,17 +32,20 @@ VERTICAL = math.sin(math.radians(0.5))   # |cos pitch| below this counts as poin
 class Gripper:
     """Fingertip geometry in the tool frame. ``finger_length_m``: how far the fingertips reach past the tool point
     along the pointing direction; ``jaw_half_width_m``: how far the open jaws reach from the tool axis along tool x
-    (the closing direction); ``margin_m`` is added to both for the envelope's monitored points."""
+    (the closing direction); ``margin_m`` is added to both for the envelope's monitored points. ``opens_at_rest``:
+    whether the jaws can open with the arm folded at its rest pose."""
     finger_length_m: float
     jaw_half_width_m: float
     margin_m: float
+    opens_at_rest: bool = True
 
 
 GRIPPERS = {
     # The SDK URDF's gripper_left/right collision meshes in the tool frame: closed or open, the jaws reach 34.2 mm
     # past the tool point; open (prismatic limit 52.4 mm per jaw), they reach 72.5 mm from the tool axis ahead of
     # the tool point.
-    "maker": Gripper(0.0342, 0.0725, 0.003),
+    # Folded at rest, the open jaws meet the arm's own body: they stop at about a tenth open.
+    "maker": Gripper(0.0342, 0.0725, 0.003, opens_at_rest=False),
     # The SDK URDF lumps the gripper into its last link without a mesh, so these are the MuJoCo model's fingers
     # (tips 15 mm past the tool point, open outer faces 50 mm from the axis) with a 10 mm margin.
     "metal": Gripper(0.015, 0.050, 0.010),
@@ -241,15 +244,22 @@ class ArmModel:
         return self.points(q)[..., 2].min(axis=-1)
 
     def lowest_z_within(self, q, tolerance: float):
-        """Lowest monitored height when every joint may be up to ``tolerance`` rad off ``q``: each point lowered
-        by the sum over joints of its drop when that joint alone moves by +-tolerance (a first-order worst case).
-        A float for one q, (T,) for a path."""
+        """Lowest monitored height when every joint may be up to ``tolerance`` rad off ``q`` (see
+        ``points_within``). A float for one q, (T,) for a path."""
+        lowest = self.points_within(q, tolerance)[..., 2].min(axis=-1)
+        return float(lowest) if np.ndim(q) == 1 else lowest
+
+    def points_within(self, q, tolerance: float) -> np.ndarray:
+        """The monitored points with each one lowered by the sum over joints of its drop when that joint alone
+        moves by +-tolerance rad (a first-order worst case): (k, 3) for one q, (T, k, 3) for a path."""
         qs = np.atleast_2d(np.asarray(q, dtype=float))
         steps = tolerance * np.vstack([np.eye(6), -np.eye(6)])
-        z = self.points(np.vstack([qs] + [qs + d for d in steps]))[..., 2].reshape(13, len(qs), -1)
+        pts = self.points(np.vstack([qs] + [qs + d for d in steps])).reshape(13, len(qs), -1, 3)
+        z = pts[..., 2]
         drop = np.maximum(0.0, z[0] - np.minimum(z[1:7], z[7:])).sum(axis=0)
-        lowest = (z[0] - drop).min(axis=-1)
-        return float(lowest[0]) if np.ndim(q) == 1 else lowest
+        lowered = pts[0].copy()
+        lowered[..., 2] -= drop
+        return lowered[0] if np.ndim(q) == 1 else lowered
 
     # ── plans ──
     def plan_joint_path(self, q0, q1, speed_rad_s: float, rate_hz: float) -> np.ndarray:

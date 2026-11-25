@@ -1,8 +1,9 @@
 """Real arms and cameras through the arm SDK (``metal_arm`` or ``maker_arm``).
 
-Opening the backend connects every arm (motors found, torque left as it is) and opens the cameras; an arm
-gets torque only from ``enable``, or with ``attach`` an arm found holding with torque on (left by an earlier
-session) is taken over where it holds. A camera that fails to open is left out and its error kept in
+Opening the backend connects every arm (motors found, torque left as it is) and opens the cameras, each in a helper
+process (``camera_process``); an arm gets torque only from ``enable``, or with ``attach`` an arm found holding with
+torque on (left by an earlier session) is listed in ``attach_candidates`` and taken over where it holds by
+``attach`` once the harness has checked its way to rest (``refuse_attach`` otherwise). A camera that fails to open is left out and its error kept in
 ``camera_errors``; the arms stay usable.
 """
 
@@ -18,10 +19,12 @@ from typing import Mapping, Optional
 import numpy as np
 
 from .base import ArmInfo, ArmState, ArmTarget, Backend, Frame
+from .camera_process import CameraProcess
 
 log = logging.getLogger(__name__)
 ENABLE_SPEED = math.radians(5.0)   # rad/s until the first target: a joint resting past a limit comes inside slowly
 REFRESH_S = 0.1                    # an arm that is off is asked for fresh feedback at most this often
+HELD_TORQUE_NM = 0.1               # a motor that cannot report torque state but measures this much load is energized
 
 
 class RealBackend(Backend):
@@ -48,8 +51,7 @@ class RealBackend(Backend):
         if missing:
             raise ValueError(f"no arm given for {', '.join(missing)}")
         if cameras is None:
-            camera_module = importlib.import_module(f"{arm_type}_arm.cameras")
-            cameras = {name: camera_module.Camera(cid) for name, cid in camera_ids.items()}
+            cameras = {name: CameraProcess(f"{arm_type}_arm.cameras", cid) for name, cid in camera_ids.items()}
         self.group = rig.ArmGroup({name: arms[name] for name in names}, parallel=parallel)
         self.rest_q = {name: np.array(q, float) for name, q in (rest_q or {}).items()}
         self.camera_max_age_s = camera_max_age_s
@@ -65,10 +67,10 @@ class RealBackend(Backend):
         self._deadline: Optional[float] = None
         self._closed = False
         self._attach_errors: dict[str, str] = {}
+        self._loaded: dict[str, list[str]] = {}   # arm off whose motors cannot report torque state but carry load
         self.ask_operator = None
         self.group.connect(clear_released=True)
-        if attach:
-            self._attach_energized()
+        self.attach_candidates: list[str] = self._energized() if attach else []
         for name, camera in cameras.items():
             try:
                 camera.open()
@@ -83,17 +85,29 @@ class RealBackend(Backend):
         rest = {name: np.radians(q) for name, q in (getattr(robot, "rest_q", None) or {}).items()}
         return cls(robot.arm, robot.arms, robot.cameras or {}, robot.arm_infos(), rest_q=rest, **kwargs)
 
-    def _attach_energized(self) -> None:
-        """Take over every arm whose motors report torque on, where it holds."""
+    def _energized(self) -> list[str]:
+        """The arms whose motors report torque on, or that cannot report it but carry load."""
+        found = []
         for name, arm in self.group:
             arm.refresh()
-            if not any(j["enabled"] for j in arm.status()["joints"].values()):
-                continue
-            try:
-                arm.attach(speed=ENABLE_SPEED)
-            except Exception as e:
-                self._attach_errors[name] = f"could not be taken over ({e}); it holds as it was. {self.recovery(name)}"
-                log.error("%s: %s", name, self._attach_errors[name])
+            joints = arm.status()["joints"]
+            if any(j["enabled"] for j in joints.values()) or _loaded(joints):
+                found.append(name)
+        return found
+
+    def attach(self, arm: str) -> None:
+        """Take over an arm of ``attach_candidates`` where it holds (the harness has checked its way to rest)."""
+        try:
+            self.group[arm].attach(speed=ENABLE_SPEED)
+        except Exception as e:
+            self._attach_errors[arm] = f"could not be taken over ({e}); it holds as it was. {self.recovery(arm)}"
+            log.error("%s: %s", arm, self._attach_errors[arm])
+
+    def refuse_attach(self, arm: str, why: str) -> None:
+        """Leave an arm of ``attach_candidates`` as it is, reporting ``why`` as its fault."""
+        self._attach_errors[arm] = (f"it was not taken over: {why}. Nothing was sent to it; it holds as it was. "
+                                    f"{self.recovery(arm)}")
+        log.error("%s: %s", arm, self._attach_errors[arm])
 
     def recovery(self, name: str) -> str:
         """How the operator brings an arm left holding down to its rest pose and turns its torque off."""
@@ -115,7 +129,14 @@ class RealBackend(Backend):
     def enable(self, arm: str, cancel: Optional[threading.Event] = None, speed: Optional[float] = None) -> None:
         a = self.group[arm]
         if a.state.name != "ENABLED":
-            a.enable(cancel=cancel, speed=ENABLE_SPEED if speed is None else min(ENABLE_SPEED, speed))
+            try:
+                a.enable(cancel=cancel, speed=ENABLE_SPEED if speed is None else min(ENABLE_SPEED, speed))
+            except Exception as e:
+                if type(e).__name__ != "HeldByAnotherProgram":
+                    raise
+                raise RuntimeError(f"another program holds this arm ({e}). Nothing was sent to it: restart the "
+                                   f"session with `llm-harness serve --attach` to take it over and rest it. "
+                                   f"{self.recovery(arm)}") from e
         if arm in self.rest_q:
             a.rest_pose = list(self.rest_q[arm]) + list((a.rest_pose or a.get_joint_positions())[6:])   # the SDK's own return goes there too
         self._released.discard(arm)
@@ -143,8 +164,10 @@ class RealBackend(Backend):
                  or (f"no fresh feedback from {', '.join(stale or no_feedback)} (no reply, or a motor fault)"
                      if stale or no_feedback else None)
                  or self._attach_errors.get(name)
-                 or ("its motors report torque on, but not from this session (left on by another program): "
-                     "restart the session with `llm-harness serve --attach` to take it over and rest it. "
+                 or ((f"its motors carry load ({', '.join(self._loaded[name])}) and their firmware does not report "
+                      "torque state: another program probably holds it. " if name in self._loaded else
+                      "its motors report torque on, but not from this session (left on by another program): ")
+                     + "restart the session with `llm-harness serve --attach` to take it over and rest it. "
                      + self.recovery(name) if state == "CONNECTED" and torque else None)
                  or self._refused.get(name))
         rest = self.rest_q.get(name)
@@ -168,11 +191,16 @@ class RealBackend(Backend):
         if cached is None or now - cached[0] >= REFRESH_S:
             replied = arm.refresh()
             stale = [label for label, ok in zip(arm.joint_names, replied) if not ok]
-            reported = [j["enabled"] for j in arm.status()["joints"].values()]
+            joints = arm.status()["joints"]
+            reported = [j["enabled"] for j in joints.values()]
             torque = True if any(on is True for on in reported) else (
                 False if not stale and all(on is False for on in reported) else None)
             if torque is None and not stale and name in self._released:
                 torque = False
+            loaded = _loaded(joints) if torque is None else []
+            self._loaded.pop(name, None)
+            if loaded:
+                torque, self._loaded[name] = True, loaded
             cached = self._off[name] = (now, torque, stale)
         return cached[1], cached[2]
 
@@ -288,3 +316,10 @@ class RealBackend(Backend):
         for camera in self._cameras.values():
             camera.close()
         return dict(self.closed_as)
+
+
+def _loaded(joints: dict) -> list[str]:
+    """The joints (from an SDK status) whose motors cannot report torque state but measure more than
+    HELD_TORQUE_NM: energized, held by whatever program last enabled them."""
+    return [f"{name} {j['torque']:+.2f} N*m" for name, j in joints.items()
+            if j.get("enabled") is None and j.get("torque") is not None and abs(j["torque"]) > HELD_TORQUE_NM]

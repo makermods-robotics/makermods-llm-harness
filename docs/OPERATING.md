@@ -169,7 +169,7 @@ misremembered height ends somewhere else.
 |---|---|---|
 | `done` | the action finished; the numbers are measured. A tool move is done only within 10 mm and 3 deg of its target; `--json` gives how far off it ended under `result.error`. | look, then decide |
 | `rejected` | refused before anything moved | read the message: it names the rule and usually the fix. Change the request; repeating it gets the same answer. |
-| `stopped` | ended early: `op stop`, a joint more than 6 deg off its path (blocked, maybe by a collision), a measured point more than 10 mm under the floor or inside a keep-out zone, a motor over the temperature limit, a motion that did not arrive, a tool move that `ended X mm and Y deg from the target` (up to 30 mm that the arm's sag explains is `done`, with the miss in the message), or a rest that ended without release. The arm holds where it is. | look at every camera before the next move. If it was blocked, find out by what. |
+| `stopped` | ended early: `op stop`, a joint more than 6 deg off its path (blocked, maybe by a collision), a measured point more than 10 mm under the floor or inside a keep-out zone, a motor over the temperature limit, a motion that did not arrive, a tool move that `ended X mm and Y deg from the target` (up to 30 mm that the arm's sag explains is `done`, with the miss in the message) or `ended N mm short of the target along the approach` (more than 10 mm: aim that much further, or use `--until contact`), or a rest that ended without release. The arm holds where it is. | look at every camera before the next move. If it was blocked, find out by what. |
 | `fault` | an arm reports a fault | stop sending actions and tell the operator what you did and saw |
 
 Common rejections:
@@ -183,6 +183,7 @@ Common rejections:
 | `would bring the ... into keep-out zone NAME ... Go around it` | the path crosses a zone (`op describe` gives its corners): move away from it first, then approach the target from another side |
 | `inside keep-out zone NAME ... only motions that keep moving out of the zone` | the arm is already in the zone: move straight away from it first |
 | `under the 0 mm hard floor once tracking error and sag are allowed for ... only motions that keep gaining height` | the arm is already too low: lift first, `op nudge 0 0 0.02` |
+| `the jaws cannot open at the rest pose` | a Maker arm folded at rest: `home` first, then open |
 | `the motors turn on only at the rest pose` | the arm was moved while off: the operator folds it back to rest |
 | `no rest pose is recorded` | the operator runs `llm-harness calibrate --rest` |
 | `name the arm: left or right` | add `--arm left` or `--arm right` |
@@ -372,6 +373,10 @@ arm in turn:
 | `--motors-off` | state that the motors are off, for an arm whose motors do not report their torque (older RobStride firmware). Check by hand that the arm moves freely first; motors that report torque on are still refused. |
 | `--watch` | hands-free table touch: the reading is taken once the gripper has moved by more than 3 cm and then held still (within 3 mm) for 5 s; gives up after 8 minutes |
 | `--table-z Z` | store a known table height without opening the robot: the world-frame z (metres) where the fingertips touch the table. A value more than 0.5 m from the arm base's height is refused. |
+| `--powered` | the arm finds the table itself, from and back to its recorded rest pose: at three points straight ahead (0.25, 0.32, 0.39 m from the base; `--points X,Y ...` for others, clear of objects) the jaws close, the fingertips go above the point pointing down and then 2 mm at a time down to the table at 3 deg/s. Contact: over two steps the fingertips went down less than 1 mm (pressed on, their reading may rise) and stood still, more than 4 mm above their command beyond the offset they held while descending freely; the table is the mean of those two readings; arm lag closes once a step ends, so it is not taken for contact. The probe runs with a contact tolerance of its own (10 mm, whatever the robot file sets). Any stop of a step other than ending short of it, or the fingertips falling 12 mm behind without standing still, ends the probe, and no step is ever sent more than 16 mm under the lowest fingertip height measured at that point. The fingertips are never sent more than 4 cm under the expected table at the point: `--expect Z`, or else the table stored for the arm's present setup at that point's reach (without either it is refused), and a table already above the start is refused. Stored as a table height per reach. Needs the rest pose recorded; refused with a motor at 50 C or more |
+
+On an arm whose model sees a flat table at a height that changes with the reach (a Maker arm: about 1 cm between
+0.26 and 0.40 m), measure it with `--powered`: the floor then follows the reach of each monitored point.
 
 When the recorded rest pose lies under the floor for the measured table (within the hard floor once tracking error
 and sag are allowed for), `calibrate` and `robot check` say so. That is allowed: the arm starts in recovery mode, where
@@ -393,4 +398,7 @@ arrive, torque left on by another program) is not moved: it holds its pose with 
 keeps holding it and waits: Enter leaves it holding and ends the session, `RELEASE` (once it is supported) turns its
 torque off there. The printed command, `metal-arm rest --arm NAME --pose <its rest pose>` (or `maker-arm`), then brings
 it down and turns torque off; `release` would turn torque off where it is and drop it. `llm-harness serve --attach`
-instead takes over an arm left holding where it is, and `rest` brings it down along a checked path.
+instead takes over an arm left holding where it is, and `rest` brings it down along a checked path; it takes the arm
+over only when its rest pose is recorded, a table calibration matches its setup and a checked path leads from where
+it holds to rest, and otherwise leaves it as it is and reports why with the `rest` command above. Motors that
+cannot report their torque state (older RobStride firmware) count as held when they carry load (more than 0.1 N*m).

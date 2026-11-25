@@ -333,3 +333,325 @@ def test_mujoco_images_from_several_threads():
         worker.start()
         worker.join(60)
         assert first["errors"] == {} and looks[0]["errors"] == {}
+
+
+# ── a contact move that ends with a joint blocked short of its goal ──
+def blocked_short(h, monkeypatch, gap=0.013):
+    """Over the surface, with the surface ``gap`` m above the end of a 3 cm descent and the in-motion contact
+    detection kept from firing (as on a Metal arm sliding along the table): the descent ends with wrist_flex about
+    3 deg short of its goal on a 7.5 deg move, the tool point 13 mm short along the approach, standing still."""
+    from makermods_llm_harness import harness as harness_module
+    h.backend.surface_z = -1.0
+    r = over_the_surface(h)
+    h.backend.surface_z = h.state().arms["arm"].tool.xyz[2] - 0.03 + gap
+    monkeypatch.setattr(harness_module, "CONTACT_RATIO", -1.0)
+    return r
+
+
+def test_a_contact_move_ending_with_a_joint_blocked_short_and_standing_still_is_contact(sim_harness, monkeypatch):
+    h = sim_harness(backend=Surface(sim_backend().arms))
+    r = blocked_short(h, monkeypatch)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert result.status == "done" and result.contact is not None, result.message
+    assert "stopped on contact at the end of the move" in result.message
+    assert result.contact["short_m"] == pytest.approx(0.013, abs=0.003) and held(h)
+
+
+def test_the_same_ending_without_until_contact_stays_stopped(sim_harness, monkeypatch):
+    h = sim_harness(backend=Surface(sim_backend().arms))
+    r = blocked_short(h, monkeypatch)
+    result = r.nudge([0, 0, -0.03])
+    assert result.status == "stopped" and result.contact is None
+    assert "deg from its goal on a 7.5 deg move" in result.message and held(h)
+
+
+class GivingWay(Surface):
+    """Stopped by the surface, the arm creeps on toward its target once the command has ended (the same target
+    twice), ``creep`` of the remaining way per tick (as it was when it met the surface): a support giving way."""
+    creep = 0.0
+    met = None
+    last = None
+
+    def step(self, targets, dt):
+        target = {name: np.asarray(t.q, dtype=float).copy() for name, t in targets.items()}
+        ended = self.last is not None and all(np.array_equal(target[n], self.last[n]) for n in target)
+        self.last = target
+        if self.met is not None and ended:
+            for name, a in self._arms.items():
+                a.q_target = target[name]
+                a.q = a.q + self.creep * (a.q_target - self.met)
+            return
+        super().step(targets, dt)
+        for a in self._arms.values():
+            if self.met is None and a.model.tool_pose(a.q)[2, 3] < self.surface_z + 0.002:
+                self.met = a.q.copy()
+
+
+def test_the_same_contact_ending_while_still_moving_stays_stopped(sim_harness, monkeypatch):
+    h = sim_harness(backend=GivingWay(sim_backend().arms))
+    r = blocked_short(h, monkeypatch, gap=0.016)
+    h.backend.creep = 0.012                              # 0.17 mm a tick: 1.3 mm over STILL_S, under the watch
+    real_window, real_hold, events = Harness._still_window, Harness._hold, []
+
+    def window(measured, seen, last):
+        found = real_window(measured, seen, last)
+        events.append(("window", found))
+        return found
+
+    def hold(self, *args, **kwargs):
+        events.append(("hold", None))
+        return real_hold(self, *args, **kwargs)
+    monkeypatch.setattr(Harness, "_still_window", staticmethod(window))
+    monkeypatch.setattr(Harness, "_hold", hold)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert result.status == "stopped" and result.contact is None and "still moving" in result.message, \
+        (result.message, result.error)
+    kinds = [kind for kind, _ in events]
+    assert "window" in kinds and kinds.index("window") < kinds.index("hold")       # judged from samples taken
+    q_past, q_last, span = events[kinds.index("window")][1]                         # under the watch, before it
+    model = h.models["arm"]                                                          # holds
+    assert span >= harness_module_still_s()
+    assert np.linalg.norm(model.tool_points(q_last) - model.tool_points(q_past)) >= 0.001
+
+
+def harness_module_still_s():
+    from makermods_llm_harness import harness as harness_module
+    return harness_module.STILL_S
+
+
+def test_the_same_contact_ending_with_a_stop_request_stays_stopped(sim_harness, monkeypatch):
+    h = sim_harness(backend=Surface(sim_backend().arms))
+    r = blocked_short(h, monkeypatch)
+    real = Harness._arrival
+
+    def arrival(self, *args, **kwargs):                  # a stop lands as the move ends
+        stopper = threading.Thread(target=self.stop)
+        stopper.start()
+        stopper.join(10)
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(Harness, "_arrival", arrival)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert result.status == "stopped" and result.contact is None and "on request" in result.message
+
+
+def test_a_stop_during_the_contact_decision_waits_for_it(sim_harness, monkeypatch):
+    h = sim_harness(backend=Surface(sim_backend().arms))
+    r = blocked_short(h, monkeypatch)
+    real_execute, real_hold = Harness._execute, Surface.hold
+    seen = {}
+
+    def execute(self, *args, **kwargs):
+        out = real_execute(self, *args, **kwargs)
+        seen["ended"] = True
+        return out
+
+    def hold(self, arm):                                  # the hold of the contact decision: a stop lands now
+        if seen.get("ended") and "stopper" not in seen:
+            abort = h._abort
+            seen["stopper"] = threading.Thread(target=lambda: seen.setdefault("stop", h.stop()))
+            seen["stopper"].start()
+            seen["stopper"].join(0.5)
+            seen["abort_set_meanwhile"] = abort.is_set()
+        return real_hold(self, arm)
+    monkeypatch.setattr(Harness, "_execute", execute)
+    monkeypatch.setattr(Surface, "hold", hold)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    seen["stopper"].join(10)
+    assert seen["abort_set_meanwhile"] is False            # the stop waited for the decision ...
+    assert result.status == "done" and result.contact is not None and seen["stop"] is None   # ... then held it
+    assert held(h)
+
+
+def test_a_support_giving_way_after_a_blocked_ending_does_not_reach_the_target(sim_harness, monkeypatch):
+    class Gives(Surface):
+        give = None
+        holding = False
+
+        def read(self):
+            if self.give is not None and not self.holding:   # the control loop drives on to the target in 0.3 s
+                t0, start = self.give
+                f = min(1.0, (time.monotonic() - t0) / 0.3)
+                for a in self._arms.values():
+                    a.q = start + f * (a.q_target - start)
+            return super().read()
+
+        def hold(self, arm):
+            self.holding = True
+            return super().hold(arm)
+
+    h = sim_harness(backend=Gives(sim_backend().arms))
+    r = blocked_short(h, monkeypatch)
+    real = Harness._execute
+
+    def execute(self, *args, **kwargs):
+        out = real(self, *args, **kwargs)
+        self.backend.give = (time.monotonic(), self.backend._arms["arm"].q.copy())   # the support gives way now
+        return out
+    monkeypatch.setattr(Harness, "_execute", execute)
+    surface = h.backend.surface_z
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert h.state().arms["arm"].tool.xyz[2] >= surface - 0.002, result.message      # held at once, not 13 mm on
+
+
+def test_a_blocked_ending_that_crept_within_the_tolerance_is_not_contact(sim_harness, monkeypatch):
+    class Creeps(Surface):
+        reads = 0
+        toward = None
+
+        def read(self):
+            if self.toward is not None and self.reads < 2:      # the tool creeps 2 x 0.4 mm on toward the target
+                self.reads += 1
+                for a in self._arms.values():
+                    a.q = a.q + 0.04 * (self.toward - self.start)
+            return super().read()
+
+    h = sim_harness(backend=Creeps(sim_backend().arms))
+    r = blocked_short(h, monkeypatch, gap=0.0105)
+    real = Harness._execute
+
+    def execute(self, *args, **kwargs):
+        out = real(self, *args, **kwargs)
+        a = self.backend._arms["arm"]
+        self.backend.start, self.backend.toward = a.q.copy(), a.q_target.copy()
+        return out
+    monkeypatch.setattr(Harness, "_execute", execute)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert result.status == "stopped" and result.contact is None, result.message
+    assert result.error["short_m"] <= 0.010                                   # the final reading decides
+
+
+class ElbowBlocked(SimBackend):
+    """elbow_flex stops where the tool point first goes under ``surface_z``; the other joints go on (as a Metal
+    arm whose shoulder blocks on the table while the rest slide the fingertips along it)."""
+    surface_z = -1.0
+    elbow = None
+
+    def step(self, targets, dt):
+        super().step(targets, dt)
+        for a in self._arms.values():
+            if self.elbow is None and a.model.tool_pose(a.q)[2, 3] < self.surface_z:
+                self.elbow = a.q[2]
+            if self.elbow is not None:
+                a.q[2] = self.elbow
+
+
+def side_slide(sim_harness, monkeypatch, table_z=None):
+    """A 3 cm vertical descent whose elbow blocks 16 mm above its end: about 3 deg short on a 6 deg move, the
+    tool point 12 mm short along the approach and 16 mm forward of it."""
+    from makermods_llm_harness import harness as harness_module
+    monkeypatch.setattr(harness_module, "CONTACT_RATIO", -1.0)
+    kwargs = {} if table_z is None else {"table_z": table_z}
+    h = sim_harness(backend=ElbowBlocked(sim_backend().arms), **kwargs)
+    r = over_the_surface(h)
+    h.backend.surface_z = h.state().arms["arm"].tool.xyz[2] - 0.03 + 0.016
+    return h, r.nudge([0, 0, -0.03], until="contact")
+
+
+def test_a_blocked_ending_to_the_side_of_its_path_and_clear_of_the_table_is_not_contact(sim_harness, monkeypatch):
+    h, result = side_slide(sim_harness, monkeypatch)
+    assert result.status == "stopped" and result.contact is None, result.message
+    assert "to the side of its path" in result.message and held(h)
+
+
+def test_a_blocked_ending_that_slid_along_the_stored_table_is_contact(sim_harness, monkeypatch):
+    h, result = side_slide(sim_harness, monkeypatch)
+    lowest = h.state().arms["arm"].clearance_m + h.envelopes["arm"].table_z     # where the arm came to rest
+    h2, result = side_slide(sim_harness, monkeypatch, table_z=lowest - 0.002)  # the table stored just there
+    assert result.status == "done" and result.contact is not None, result.message
+    assert abs(h2.state().arms["arm"].clearance_m) <= 0.01
+
+
+def test_a_second_contact_descent_goes_no_deeper_than_the_first_was_held(sim_harness):
+    h = sim_harness()                                      # no surface: the arm would sink through the table
+    r = over_the_surface(h)
+    clearance = h.state().arms["arm"].clearance_m
+    first = r.nudge([0, 0, -(clearance + 0.020)], until="contact")
+    held_at = h.state().arms["arm"].clearance_m
+    assert first.status == "stopped" and held_at == pytest.approx(-0.010, abs=0.002)   # the watch: 10 mm under
+    second = r.nudge([0, 0, -0.010], until="contact")
+    assert second.status != "done"
+    assert h.state().arms["arm"].clearance_m >= held_at - 0.001
+
+
+# ── a contact move onto a correctly stored table ──
+class OnTable(SimBackend):
+    """The arm stops where its lowest point would go under the table the harness has stored (``table_z``)."""
+
+    def step(self, targets, dt):
+        before = {name: a.q.copy() for name, a in self._arms.items()}
+        super().step(targets, dt)
+        for name, a in self._arms.items():
+            if a.model.lowest_z(a.q) < self.table_z:
+                a.q = before[name]
+
+
+def test_a_contact_move_may_aim_a_bounded_depth_under_a_correctly_stored_table(sim_harness):
+    h = sim_harness(backend=OnTable(sim_backend().arms))
+    r = over_the_surface(h)
+    clearance = h.state().arms["arm"].clearance_m
+    plain = r.nudge([0, 0, -(clearance + 0.012)], dry_run=True)
+    assert plain.status == "rejected" and "hard floor" in plain.message           # other moves: not under it
+    deep = r.nudge([0, 0, -(clearance + 0.030)], until="contact", dry_run=True)   # past the 25 mm contact depth
+    result = r.nudge([0, 0, -(clearance + 0.020)], until="contact")
+    assert result.status == "done" and result.contact is not None, result.message
+    assert deep.status == "rejected" and "floor of a move with until contact" in deep.message
+    assert h.state().arms["arm"].clearance_m == pytest.approx(0.0, abs=0.003)     # it stopped on the table
+    assert SafetyConfig().contact_depth_m == 0.025
+
+
+def test_repeated_contact_nudges_from_under_the_measured_limit_are_refused(sim_harness):
+    h = sim_harness()                                      # no surface: the arm would sink through the table
+    r = over_the_surface(h)
+    clearance = h.state().arms["arm"].clearance_m
+    assert r.nudge([0, 0, -(clearance + 0.020)], until="contact").status == "stopped"
+    held_at = h.state().arms["arm"].clearance_m            # held about 10 mm under the stored table
+    for _ in range(5):
+        result = r.nudge([0, 0, -0.003], until="contact")
+        assert result.status == "rejected" and "only motions that do not go lower" in result.message
+    assert h.state().arms["arm"].clearance_m >= held_at - 0.0005                     # no ratchet
+    assert r.nudge([0, 0, 0.02]).ok                                                  # lifting is allowed
+
+
+def per_reach(rested, below_m, reaches):
+    """A table measured at ``reaches`` (two), each ``below_m`` under the world z ``rested``."""
+    from makermods_llm_harness.safety import Table
+    z = rested - below_m
+    return {"arm": Table(z, tuple((r, z) for r in reaches))}
+
+
+def test_a_blocked_ending_13_mm_above_the_measured_table_outside_its_reaches_is_not_contact(sim_harness,
+                                                                                            monkeypatch):
+    h, result = side_slide(sim_harness, monkeypatch)
+    rested = h.state().arms["arm"].clearance_m + h.envelopes["arm"].table_z
+    h2, result = side_slide(sim_harness, monkeypatch, table_z=per_reach(rested, 0.013, (0.15, 0.20)))
+    assert h2.state().arms["arm"].clearance_m < 0.010       # taken high outside the reaches: 8 mm ...
+    assert result.status == "stopped" and result.contact is None, result.message     # ... but 13 mm measured
+
+
+def test_a_blocked_ending_resting_on_the_measured_table_beyond_its_last_reach_is_contact(sim_harness, monkeypatch):
+    h, result = side_slide(sim_harness, monkeypatch)
+    state = h.backend.read()["arm"]
+    model = h.models["arm"]
+    rested = h.state().arms["arm"].clearance_m + h.envelopes["arm"].table_z
+    lowest = model.points(state.q)[int(np.argmin(model.points(state.q)[:, 2]))]
+    reach = float(np.hypot(lowest[0], lowest[1]))
+    table = per_reach(rested, -0.0015, (reach - 0.10, reach - 0.018))    # 1.5 mm over it, 18 mm short of its reach
+    h2, result = side_slide(sim_harness, monkeypatch, table_z=table)
+    assert result.status == "done" and result.contact is not None, result.message
+
+
+def test_a_contact_descent_that_rebounds_after_its_last_watched_sample_is_held(sim_harness, monkeypatch):
+    h = sim_harness(safety=SafetyConfig(contact_tolerance_m=0.004))
+    r = over_the_surface(h)
+    start = h.backend.read()["arm"].q.copy()
+    real = Harness._execute
+
+    def execute(self, *args, **kwargs):                  # after the last watched sample the arm springs back up
+        out = real(self, *args, **kwargs)
+        a = self.backend._arms["arm"]
+        a.q = a.q + (6.5 / 30) * (start - a.q)              # 6.5 mm of the 30 mm descent
+        return out
+    monkeypatch.setattr(Harness, "_execute", execute)
+    result = r.nudge([0, 0, -0.03], until="contact")
+    assert result.status == "stopped" and result.contact is None, result.message
+    assert held(h)                                         # the descent target is no longer active

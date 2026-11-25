@@ -471,11 +471,12 @@ def test_an_arm_left_energized_is_attached_and_rested(kind):
     assert plain.close() == {"arm": "energized"}
 
     backend = backend_for(True)
+    assert backend.attach_candidates == ["arm"] and backend.read()["arm"].fault      # not yet: the harness checks
+    table = float(model.lowest_z(rest)) - 0.10
+    h = Harness.open(backend=backend, table_z=table, safety=SafetyConfig(max_speed_deg_s=120, slow_speed_deg_s=40))
     state = backend.read()["arm"]
     assert state.enabled is True and state.fault is None
     assert np.degrees(np.abs(np.array(sim.positions[:6]) - held)).max() < 0.05     # taken over without moving
-    table = float(model.lowest_z(rest)) - 0.10
-    h = Harness.open(backend=backend, table_z=table, safety=SafetyConfig(max_speed_deg_s=120, slow_speed_deg_s=40))
     obs = h.rest()
     assert obs.result.ok, obs.result.message
     assert np.degrees(np.abs(np.array(sim.positions[:6]) - rest)).max() < 2.0
@@ -490,3 +491,202 @@ def test_a_hold_returns_the_sdk_setpoint_and_waits_two_control_periods(rig):
     assert np.allclose(q, commanded[:6]) and -0.01 <= opening <= 1.01      # the measured opening, unclipped
     rate = backend.group["arm"].config.control_rate_hz
     assert backend.hold_settle_s == pytest.approx(2.0 / rate)
+
+
+def held_by_a_dead_program(kind="maker"):
+    """An arm with motors that cannot report torque state, left holding at home by a session that ended; its
+    joints then measure load, as a real arm carrying its weight does (the SDK simulator models none)."""
+    testing = importlib.import_module(f"{kind}_arm.testing")
+    first, sim = testing.simulated_arm(params_supported=False)
+    rest = np.array(sim.positions[:6])
+    model = ArmModel(ArmInfo("arm", kind))
+    first.connect()
+    first.enable()
+    assert first.move_to(list(model.home_q) + first.get_joint_positions()[6:], speed=3.0, timeout=10.0)
+    first.detach()
+    arm = importlib.import_module(f"{kind}_arm.arm").Arm(sim.config, first.backend)
+    real = arm.get_joint_torques
+    arm.get_joint_torques = lambda: [t + (1.4 if i == 1 else 0.0) for i, t in enumerate(real())]
+    return arm, sim, model, rest
+
+
+def test_an_old_firmware_arm_carrying_load_is_held_by_another_program_and_attach_takes_it_over():
+    arm, sim, model, rest = held_by_a_dead_program()
+    plain = RealBackend("maker", {}, {}, [ArmInfo("arm", "maker")], arms={"arm": arm}, rest_q={"arm": rest})
+    state = plain.read()["arm"]
+    assert state.enabled is True and "another program probably holds it" in state.fault
+    assert "--attach" in state.fault and "shoulder_lift +1.4" in state.fault
+    h = Harness.open(backend=plain, table_z=-0.5)
+    obs = h.step({"action": "home"})
+    assert obs.result.status == "fault" and "--attach" in obs.result.message        # nothing sent to it
+    h.close()
+    arm, sim, model, rest = held_by_a_dead_program()
+    held = np.array(sim.positions[:6])
+    backend = RealBackend("maker", {}, {}, [ArmInfo("arm", "maker")], arms={"arm": arm}, rest_q={"arm": rest},
+                          attach=True)
+    h = Harness.open(backend=backend, table_z=float(model.lowest_z(rest)) - 0.10,
+                     safety=SafetyConfig(max_speed_deg_s=120, slow_speed_deg_s=40))
+    state = backend.read()["arm"]
+    assert state.enabled is True and state.fault is None
+    assert np.degrees(np.abs(np.array(sim.positions[:6]) - held)).max() < 0.05      # taken over where it held
+    assert h.rest().result.ok
+    assert h.close() == {"arm": "released"}
+
+
+@pytest.mark.parametrize("missing", ["rest pose", "table", "way home"])
+def test_attach_leaves_a_held_arm_alone_without_a_rest_pose_a_table_or_a_checked_way_home(missing, monkeypatch):
+    from makermods_llm_harness.safety import MoveRejected
+    arm, sim, model, rest = held_by_a_dead_program()
+    held = np.array(sim.positions[:6])
+    backend = RealBackend("maker", {}, {}, [ArmInfo("arm", "maker")], arms={"arm": arm},
+                          rest_q={} if missing == "rest pose" else {"arm": rest}, attach=True)
+    if missing == "way home":
+        def no_way(self, env, model, q0, goal):
+            raise MoveRejected("arm: a keep-out zone lies between it and the rest pose.")
+        monkeypatch.setattr(Harness, "_rest_legs", no_way)
+    h = Harness.open(backend=backend, table_z=None if missing == "table" else float(model.lowest_z(rest)) - 0.10)
+    state = backend.read()["arm"]
+    assert "it was not taken over" in state.fault and "maker-arm rest --arm arm" in state.fault
+    assert {"rest pose": "no rest pose", "table": "no table calibration", "way home": "no checked way"}[missing] \
+        in state.fault
+    assert backend.group["arm"].state.name == "CONNECTED"                           # nothing sent to it
+    obs = h.step({"action": "rest"})
+    assert not obs.result.ok
+    assert np.degrees(np.abs(np.array(sim.positions[:6]) - held)).max() < 0.05
+    h.close()
+    assert backend.group["arm"].state.name != "ENABLED"
+
+
+def test_an_enable_the_sdk_refuses_for_a_held_arm_names_attach(rig, monkeypatch):
+    backend, sim, _ = rig
+    kind = "maker" if "maker" in type(backend.group["arm"]).__module__ else "metal"
+    errors = importlib.import_module(f"{kind}_arm.errors")
+
+    def refuse(*args, **kwargs):
+        raise errors.HeldByAnotherProgram("motors 2 (shoulder_lift) are producing torque")
+    monkeypatch.setattr(backend.group["arm"], "enable", refuse)
+    h = Harness.open(backend=backend, table_z=-0.5)
+    obs = h.step({"action": "home"})
+    assert obs.result.status == "fault" and "another program holds this arm" in obs.result.message
+    assert "llm-harness serve --attach" in obs.result.message and f"{kind}-arm rest --arm arm" in obs.result.message
+
+
+FAKE_CAMERAS = '''
+import time
+import numpy as np
+from maker_arm.cameras import Frame
+
+class Camera:
+    def __init__(self, id):
+        self.id = id
+
+    def open(self):
+        if self.id == "broken":
+            raise OSError("no such camera")
+
+    def newest(self, max_age_s=None):
+        if self.id == "old" and max_age_s is not None:
+            return None
+        if self.id == "stalls":
+            time.sleep(3600)
+        return Frame(np.full((4, 6, 3), 7, np.uint8), time.time(), time.monotonic())
+
+    def close(self):
+        pass
+'''
+
+
+def test_cameras_built_from_ids_run_in_a_helper_process(tmp_path, monkeypatch):
+    from makermods_llm_harness.backends.camera_process import CameraProcess
+    (tmp_path / "fake_cameras.py").write_text(FAKE_CAMERAS)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    camera = CameraProcess("fake_cameras", "front")
+    camera.open()
+    try:
+        pid = camera._proc.pid
+        assert pid != __import__("os").getpid()
+        frame = camera.newest(1.0)
+        assert frame[0].shape == (4, 6, 3) and int(frame[0][0, 0, 0]) == 7 and frame.captured is not None
+    finally:
+        camera.close()
+    assert camera.newest(1.0) is None                                     # closed: no frame, no error
+    old = CameraProcess("fake_cameras", "old")
+    old.open()
+    assert old.newest(1.0) is None
+    old.close()
+    with pytest.raises(OSError, match="did not open: no such camera"):
+        CameraProcess("fake_cameras", "broken").open()
+
+
+@pytest.mark.parametrize("then", ["wait", "close"])
+def test_a_camera_helper_that_stalls_is_killed_and_never_blocks(tmp_path, monkeypatch, then):
+    import os
+    import signal
+    from makermods_llm_harness.backends import camera_process
+    (tmp_path / "fake_cameras.py").write_text(FAKE_CAMERAS)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    frame_s, close_s = getattr(camera_process, "FRAME_S", 1.0), getattr(camera_process, "CLOSE_S", 1.0)
+    camera = camera_process.CameraProcess("fake_cameras", "stalls")
+    camera.open()
+    proc = camera._proc
+    got = []
+    reader = threading.Thread(target=lambda: got.append(camera.newest(1.0)), daemon=True)
+    try:
+        start = time.monotonic()
+        reader.start()
+        if then == "close":                       # quit while a frame request is stuck: close does not wait on it
+            time.sleep(0.3)
+            closer = threading.Thread(target=camera.close, daemon=True)
+            closer.start()
+            closer.join(close_s + 1.0)
+            assert not closer.is_alive()
+        reader.join(frame_s + 1.5)
+        assert not reader.is_alive() and got == [None] and time.monotonic() - start < frame_s + 1.5
+        deadline = time.monotonic() + 2.0
+        while proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert proc.poll() is not None                                    # killed and reaped
+        t = time.monotonic()
+        assert camera.newest(1.0) is None and time.monotonic() - t < 0.1  # no frame, no wait, from then on
+    finally:
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGKILL)
+        camera.close()
+
+
+def test_a_backend_from_camera_ids_uses_helper_processes(monkeypatch):
+    built = []
+
+    class Recorder:
+        def __init__(self, module, cid):
+            built.append((module, cid))
+
+        def open(self):
+            pass
+
+        def newest(self, max_age_s=None):
+            return None
+
+        def close(self):
+            pass
+    monkeypatch.setattr("makermods_llm_harness.backends.real.CameraProcess", Recorder)
+    arm, sim = importlib.import_module("maker_arm.testing").simulated_arm()
+    backend = RealBackend("maker", {}, {"front": "url:http://127.0.0.1:1/front"}, [ArmInfo("arm", "maker")],
+                          arms={"arm": arm})
+    backend.close()
+    assert built == [("maker_arm.cameras", "url:http://127.0.0.1:1/front")]
+
+
+def test_the_camera_helper_takes_the_slowest_cpus_only_when_they_differ(tmp_path, monkeypatch):
+    from makermods_llm_harness.backends.camera_process import slow_cpus
+    monkeypatch.setattr("os.cpu_count", lambda: 4)
+    for cpu, capacity in enumerate((446, 446, 1024, 1024)):
+        (tmp_path / f"cpu{cpu}").mkdir()
+        (tmp_path / f"cpu{cpu}" / "cpu_capacity").write_text(f"{capacity}\n")
+    assert slow_cpus(str(tmp_path)) == {0, 1}
+    for cpu in range(4):
+        (tmp_path / f"cpu{cpu}" / "cpu_capacity").write_text("1024\n")
+    assert slow_cpus(str(tmp_path)) is None
+    assert slow_cpus(str(tmp_path / "missing")) is None

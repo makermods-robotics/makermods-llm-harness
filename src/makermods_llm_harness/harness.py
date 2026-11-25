@@ -25,6 +25,7 @@ from .backends.base import OFF, ArmState, ArmTarget, Backend
 from .log import EpisodeLog
 from .robot import Robot, load as load_robot
 from .safety import REST_TOLERANCE_DEG, Envelope, KeepOut, MoveRejected, SafetyConfig, load_calibration
+from .safety import table as stored_table
 
 SETTLED = math.radians(1.0)
 NEAR_VERTICAL_COS = 0.2            # |cos(pitch)| under which the tool counts as pointing straight up or down
@@ -49,6 +50,7 @@ GRIP_HOLD_EPS = 0.01               # ... and the commanded gripper opening this 
 FRESH_HOLD_S = 0.25                # ... from feedback no older than this
 HOLD_WAIT_S = 10.0                 # longest wait for the harness before a hold after a failed queued action
 STILL_S = 0.3                      # elapsed window over which standing still is judged
+CONTACT_LATERAL_M = 0.010          # a contact ending lies this close to the planned tool path, or at the table
 COMMAND_MOVED_M = 0.001            # contact: while the command moves further than this over STILL_S (one lag
 CONTACT_RATIO = 0.25               # earlier), the tool point advances less than this fraction as far along it, for
                                    # STILL_S more; the shortfall then exceeds what it was while advancing freely
@@ -75,6 +77,11 @@ READ_ONLY = "this session is read-only: only observe and wait are allowed."
 
 class HarnessClosed(RuntimeError):
     """The harness is closed: it takes no more actions or observations."""
+
+
+class _BlockedShort(Result):
+    """A move with until contact that ended with a joint blocked short of its goal, not yet held: ``_arrival``
+    reports contact when the tool point stands still short along the approach, else holds it as stopped."""
 
 
 class _Outcome(Exception):
@@ -140,6 +147,7 @@ class Harness:
         self._released: dict[str, str] = {}               # backend.rest() outcome per arm, read by close()
         self._commanded: dict[str, tuple[np.ndarray, np.ndarray]] = {}   # tool pose and joints of the last done motion
         self._heading: dict[str, tuple[np.ndarray, Optional[np.ndarray]]] = {}   # end joints and pose of a motion
+        self._ending: dict[str, tuple] = {}     # a contact move's end: (stillness window, last q, planned tool path)
         self._closed = False
         if log:
             log.start(robot_name, list(self.models), self.cameras,
@@ -152,7 +160,8 @@ class Harness:
              read_only: bool = False, backend_options: Optional[dict] = None,
              keep_out: Optional[Sequence[KeepOut]] = None) -> "Harness":
         """A harness for a robot (name, file, Robot, or the only robot defined) on its own backend, or on
-        ``backend``. Table heights come from ``table_z`` (one for all arms or per arm), else the backend
+        ``backend``. Table heights (numbers or ``safety.Table``) come from ``table_z`` (one for all arms or per arm),
+        else the backend
         (simulators), else the robot's stored calibration when it was measured on the same setup.
         ``backend_options`` go to the robot's backend when it is opened here. Keep-out zones come from
         ``keep_out``, else the robot's."""
@@ -168,7 +177,7 @@ class Harness:
                 heights = {n: backend.table_z for n in names}
             else:
                 stored = load_calibration(robot.name) if robot else {}
-                heights = {n: stored[n]["table_z"] for n in names
+                heights = {n: stored_table(stored[n]) for n in names
                            if n in stored and stored[n]["setup"] == robot.setup(n, safety)}
             if isinstance(table_z, dict):
                 heights.update(table_z)
@@ -181,6 +190,8 @@ class Harness:
             if robot and robot.home:
                 for model in harness.models.values():
                     model.set_home(robot.home["xyz"], float(robot.home.get("pitch", 0.0)))
+            for name in getattr(backend, "attach_candidates", ()):
+                harness._take_over(name)
             return harness
         except BaseException:
             if opened:
@@ -521,6 +532,7 @@ class Harness:
         env.require_table()
         state = self._usable(name)
         if isinstance(act, Gripper):
+            self._gripper_check(name, state, act.opening)
             return self._gripper(name, self._ready(name, state), act.opening)
         if not state.enabled:
             # Planned and checked first (from where enabling leaves it), so a refused request never turns it on.
@@ -553,7 +565,8 @@ class Harness:
         if result.contact is not None or result.status == "fault":
             return result
         if goal is not None:
-            result = self._arrival(name, goal, result, contact, state.q_target - state.q)
+            result = self._arrival(name, goal, result, contact, state.q_target - state.q,
+                                   model.tool_points(state.q))
         if result.ok and result.contact is None:
             self._commanded[name] = (model.tool_pose(path[-1]) if goal is None else goal, path[-1])
         return result
@@ -586,6 +599,7 @@ class Harness:
         if not state.enabled:
             self._enable_ramp(name, state)
         if isinstance(act, Gripper):
+            self._gripper_check(name, state, act.opening)
             return Result(message="dry run: it would pass the checks; nothing moved.")
         q0, commanded = self._check_start(name, state)
         path, _, _ = self._checked_path(name, act, q0, commanded)
@@ -615,13 +629,30 @@ class Harness:
         return held[0] if position <= ARRIVAL_TOL_M and math.degrees(angle) <= ARRIVAL_TOL_DEG else None
 
     def _arrival(self, name: str, goal: np.ndarray, result: Result, contact: bool = False,
-                 standing: Optional[np.ndarray] = None) -> Result:
-        """A tool move's result with how far the measured tool pose ended from ``goal`` (``error``). Done only from
-        valid, fresh final feedback (no fault, finite joints, torque on, every joint's sample at most FRESH_HOLD_S
-        old; a fault otherwise) with the measured tool pose within the arrival tolerance. A miss that the joint
-        ``standing`` error the arm held before the move (command minus measurement) explains, up to
-        SAG_ARRIVAL_TOL_M, is done with the miss in the message; any other miss is ``stopped``. ``contact``: the move asked for contact and found none."""
+                 standing: Optional[np.ndarray] = None, start: Optional[np.ndarray] = None) -> Result:
+        """A tool move's result with how far the measured tool pose ended from ``goal`` (``error``; with ``start``,
+        the tool point the move started from, also ``short_m``: how far it ended short of the goal along the
+        approach; ``ended_short`` True when that alone stopped it). Done only from valid, fresh final feedback (no fault, finite joints, torque on, every joint's
+        sample at most FRESH_HOLD_S old; a fault otherwise) with the measured tool pose within the arrival
+        tolerance. A miss that the joint ``standing`` error the arm held before the move (command minus measurement)
+        explains, up to SAG_ARRIVAL_TOL_M, is done with the miss in the message; any other miss is ``stopped``, and so
+        is a move that ended more than the contact tolerance short along the approach, whatever the arrival
+        tolerance. ``contact``: the move asked for contact; one that ended more than the contact tolerance short at
+        its last watched sample or at a fresh read now, or with a joint blocked short of its goal
+        (``_BlockedShort``), is judged by ``_contact_ending``."""
         model = self.models[name]
+        blocked = isinstance(result, _BlockedShort)
+        if contact and (result.ok or blocked):
+            ending = self._ending.pop(name, None)
+            last = None if ending is None or start is None else _shortfall(goal[:3, 3], start,
+                                                                          model.tool_points(ending[1]))
+            with self._io:
+                now = self._dev.read()[name].q
+            fresh = None if start is None or not np.all(np.isfinite(now)) else _shortfall(goal[:3, 3], start,
+                                                                                       model.tool_points(now))
+            tolerance = self.config.contact_tolerance_m
+            if blocked or any(s is not None and s > tolerance for s in (last, fresh)):
+                return self._contact_ending(name, goal, result, ending, start)
         with self._io:
             state = self._dev.read()[name]
             ages = self._dev.feedback_ages(name)
@@ -637,6 +668,17 @@ class Harness:
         if not (math.isfinite(position) and math.isfinite(angle)):
             return self._hold(name, f"{name}: the tool pose at the end of the move is not a finite number.", "fault")
         result.error = {"position_m": round(position, 4), "angle_deg": round(math.degrees(angle), 1)}
+        short = None if start is None else _shortfall(goal[:3, 3], start, model.tool_points(state.q))
+        if short is not None:
+            result.error["short_m"] = round(short, 4)
+        tolerance = self.config.contact_tolerance_m
+        if result.ok and not contact and short is not None and short > tolerance:
+            held = self._hold(name, f"{name}: ended {short * 1000:.0f} mm short of the target along the approach "
+                                    f"({position * 1000:.0f} mm and {math.degrees(angle):.1f} deg from it). It may "
+                                    "rest on something, or the arm sags there: the arm holds where it is. Aim "
+                                    f"{short * 1000:.0f} mm further, or move with until contact.")
+            held.error = dict(result.error, ended_short=True) if held.status == "stopped" else result.error
+            return held
         if result.ok and (position > ARRIVAL_TOL_M or math.degrees(angle) > ARRIVAL_TOL_DEG):
             explained = False
             if standing is not None:
@@ -654,13 +696,80 @@ class Harness:
             result.message = f"{name}: reached the target without contact."
         return result
 
-    def _on_contact(self, name: str, goal: np.ndarray, q: np.ndarray, error: Optional[dict] = None) -> Result:
-        """Hold the arm where a move with until contact stopped following its command, and say where."""
+    def _contact_ending(self, name: str, goal: np.ndarray, result: Result, ending: Optional[tuple],
+                        start: Optional[np.ndarray]) -> Result:
+        """A contact move's end, held first: under the stop gate (a stop either came first, and wins, or waits for
+        this result) the arm is held, read, and judged. Contact (done) when the samples taken under the watch show
+        the tool point still over STILL_S (moving less than COMMAND_MOVED_M, also up to the held reading), the held
+        reading is more than the contact tolerance short along the approach, and the tool point is within
+        CONTACT_LATERAL_M of the planned tool path or the arm's lowest point is at the measured table (within the
+        contact tolerance above it, no outside-reach margin: resting on the known surface explains a slide along
+        it). Anything else is ``stopped``;
+        too few samples to tell, too."""
+        model, env, tol = self.models[name], self.envelopes[name], self.config.contact_tolerance_m
+        blocked = isinstance(result, _BlockedShort)
+        window, _, planned = ending if ending is not None else (None, None, None)
+        with self._gate:
+            if self._abort is not None and self._abort.is_set():
+                return self._hold(name, f"{name}: stopped on request; the arm holds where it is.")
+            held = self._hold(name, result.message if blocked else f"{name}: the move ended.")
+            if held.status != "stopped":
+                return held
+            with self._io:
+                state = self._dev.read()[name]
+                ages = self._dev.feedback_ages(name)
+            fresh = ages is None or all(age is not None and math.isfinite(age) and age <= FRESH_HOLD_S for age in ages)
+            if state.fault or state.enabled is not True or not np.all(np.isfinite(state.q)) or not fresh:
+                return Result("fault", f"{name}: the feedback after the hold is not valid ("
+                                       f"{state.fault or 'torque state or fresh feedback missing'}).")
+            xyz = model.tool_points(state.q)
+            position, angle = pose_error(model.tool_pose(state.q), goal)
+            short = None if start is None else _shortfall(goal[:3, 3], start, xyz)
+            error = {"position_m": round(position, 4), "angle_deg": round(math.degrees(angle), 1)}
+            if short is not None:
+                error["short_m"] = round(short, 4)
+            lateral = math.inf if planned is None else _path_distance(planned, xyz)
+            clearance = env.measured_clearance(state.q)
+            if window is None:
+                why = f"too few samples after the command ended to tell whether it stood still over {STILL_S:g} s"
+            else:
+                q_past, q_last, span = window
+                moved = max(float(np.linalg.norm(model.tool_points(q_last) - model.tool_points(q_past))),
+                            float(np.linalg.norm(xyz - model.tool_points(q_last))))
+                if moved >= COMMAND_MOVED_M:
+                    why = f"was still moving ({moved * 1000:.1f} mm over {span:.2f} s)"
+                elif short is None or short <= tol:
+                    why = (f"ended {0.0 if short is None else short * 1000:.1f} mm short of the target, within the "
+                           f"{tol * 1000:.0f} mm contact tolerance")
+                elif lateral > CONTACT_LATERAL_M and clearance > tol:
+                    why = (f"ended {lateral * 1000:.0f} mm to the side of its path and {clearance * 1000:.0f} mm above "
+                           "the table: not a contact along its approach")
+                else:
+                    why = None
+            if why is None:
+                reach = float(np.linalg.norm(goal[:3, 3] - xyz))
+                where = ", ".join(f"{v:.3f}" for v in xyz)
+                out = Result("done", f"{name}: stopped on contact at the end of the move {reach * 1000:.0f} mm short "
+                                     f"of the target, tool point at [{where}] m; the arm holds there.")
+                out.contact = {"xyz": [round(float(v), 4) for v in xyz], "short_m": round(reach, 4)}
+            elif blocked:
+                out = Result("stopped", f"{result.message} Not a contact: it {why}.")
+            else:
+                out = Result("stopped", f"{name}: the move ended short of its target and {why}. The arm holds where "
+                                        "it is; look at the cameras.")
+            out.error = error
+            return out
+
+    def _on_contact(self, name: str, goal: np.ndarray, q: np.ndarray, error: Optional[dict] = None,
+                    at_end: bool = False) -> Result:
+        """Hold the arm where a move with until contact stopped following its command (``at_end``: where it stood
+        short of the target once the command had ended), and say where."""
         xyz = self.models[name].tool_points(q)
         short = float(np.linalg.norm(goal[:3, 3] - xyz))
         where = ", ".join(f"{v:.3f}" for v in xyz)
-        result = self._hold(name, f"{name}: stopped on contact {short * 1000:.0f} mm short of the target, tool point "
-                                  f"at [{where}] m; the arm holds there.", "done")
+        when = " at the end of the move" if at_end else ""
+        result = self._hold(name, f"{name}: stopped on contact{when} {short * 1000:.0f} mm short of the target, tool "
+                                  f"point at [{where}] m; the arm holds there.", "done")
         if result.ok:
             result.contact = {"xyz": [round(float(v), 4) for v in xyz], "short_m": round(short, 4)}
         result.error = error
@@ -690,6 +799,15 @@ class Harness:
             raise MoveRejected(f"{name}: a motor is at {state.temperature:.0f} C, over the "
                                f"{self.config.max_temp_c:.0f} C limit. Wait for it to cool, then try again.")
         return state
+
+    def _gripper_check(self, name: str, state: ArmState, opening: float) -> None:
+        """Refuse opening jaws that cannot open at the rest pose while the arm stands there."""
+        model = self.models[name]
+        if model.gripper.opens_at_rest or state.rest_q is None or opening <= state.gripper + GRIP_STILL:
+            return
+        if float(np.max(np.abs(state.q - state.rest_q))) <= math.radians(REST_TOLERANCE_DEG):
+            raise MoveRejected(f"{name}: the jaws cannot open at the rest pose: they meet the arm there. Move it out "
+                               "first (home), then open them.")
 
     def _can_enable(self, name: str, state: ArmState) -> None:
         """Refuse to turn on an arm that is not at its recorded rest pose."""
@@ -772,7 +890,7 @@ class Harness:
         else:
             q1 = model.home_q if isinstance(act, Home) else self._joint_goal(model, q0, act)
             path = self._plan(env, model.plan_joint_path, q0, q1, **timing)
-        env.check(q0, path, capped=not isinstance(act, Home))
+        env.check(q0, path, capped=not isinstance(act, Home), contact=getattr(act, "until", None) == "contact")
         cap = env.speed_for(q0, path) if measured is None else min(env.speed_for(q0, path),
                                                                   env.speed_for(measured, path))
         if speed is not None:
@@ -865,7 +983,8 @@ class Harness:
         ``judge_motion`` decides from the start (``q0``, and ``start_command``, the command the arm held before),
         the goal and the end, with ``held`` joints (kept at their command) judged on drift only and ``requested``
         joints (asked for by name) held to the small-move rule. Anything but done holds the arm and confirms it
-        (``_hold``). ``rest`` lets a hot arm go on; ``floor`` lowers the measured clearance it is held under (the
+        (``_hold``), except a contact move that ended with a joint blocked short of its goal: that comes back unheld
+        as ``_BlockedShort`` for ``_arrival`` to judge. ``rest`` lets a hot arm go on; ``floor`` lowers the measured clearance it is held under (the
         way down to a rest pose under the floor).
 
         With ``contact_goal`` (until contact, the requested tool pose) the motion ends, done, on contact: once the
@@ -873,9 +992,10 @@ class Harness:
         CONTACT_RATIO as far as the command one lag earlier, for longer than STILL_S, while the command was still
         moving (more than COMMAND_MOVED_M), and it is further than ``contact_tolerance_m`` from every tool point
         sent within the lag beyond both its standing offset at the start and the largest shortfall it had while
-        advancing freely (load changes and lag). A shortfall seen only after the
-        command stopped is never contact."""
+        advancing freely (load changes and lag). A shortfall still there once the command has ended is judged by
+        ``_arrival``."""
         model, env, cfg = self.models[name], self.envelopes[name], self.config
+        self._ending.pop(name, None)
         start_command = q0 if start_command is None else np.asarray(start_command, dtype=float)
         floor = min(env.hold_floor(q0), math.inf if floor is None else floor)
         zones = env.keep_out_hold(q0, path[-1] if rest else None)
@@ -894,7 +1014,7 @@ class Harness:
         tools = None if tool is None else np.empty((len(ext), 3))
         if tools is not None:
             tools[0] = model.tool_points(q0)
-        clock, first, following, state, settling = 0.0, 0, False, None, None
+        clock, first, following, state, settling, last = 0.0, 0, False, None, None, 0
         slow_since, free_short = None, 0.0
         tick_end = time.monotonic()
         for t in range(len(ext) - 1):
@@ -916,6 +1036,7 @@ class Harness:
             clock += max(self._dt, now - tick_end)
             tick_end = now
             measured[t + 1], seen[t + 1] = state.q, clock
+            last = t + 1
             if tools is None:
                 continue
             tools[t + 1] = model.tool_points(state.q)
@@ -948,6 +1069,9 @@ class Harness:
                                         f"{cfg.tracking_lag_s:g} s"
                                         + (", and the arm never followed its command" if not following else "")
                                         + "). The arm holds where it is; look at the cameras.")
+        if contact_goal is not None:
+            self._ending[name] = (self._still_window(measured, seen, last), measured[last].copy(),
+                                  tool[:len(path) + 1].copy())
         verdict = judge_motion(goal, q0, start_command, state.q, env.tolerance,
                                held=held, requested=requested)
         if verdict is None:
@@ -963,7 +1087,18 @@ class Harness:
                                 f"{math.degrees(abs(goal[j] - start_command[j])):.2f} "
                                 f"deg and moved {math.degrees(abs(state.q[j] - q0[j])):.2f} deg, too little to tell a "
                                 "move from a block"}[kind]
+        if kind == "short" and contact_goal is not None:
+            return _BlockedShort("stopped", f"{name}: {what}. The arm holds where it is; look at the cameras.")
         return self._hold(name, f"{name}: {what}. The arm holds where it is; look at the cameras.")
+
+    @staticmethod
+    def _still_window(measured: np.ndarray, seen: np.ndarray, last: int) -> Optional[tuple]:
+        """The joints measured at the last tick and the latest earlier tick at least STILL_S before it, and the
+        elapsed time between: ``(q_past, q_last, span)``; None when the samples span less than STILL_S."""
+        past = int(np.searchsorted(seen[:last + 1], seen[last] - STILL_S, side="right")) - 1
+        if past < 0 or seen[last] - seen[past] < STILL_S:
+            return None
+        return measured[past].copy(), measured[last].copy(), float(seen[last] - seen[past])
 
     @staticmethod
     def _joints_still(measured: np.ndarray, seen: np.ndarray, last: int, now: float) -> bool:
@@ -1221,6 +1356,28 @@ class Harness:
             return Result("rejected", f"{name}: no rest pose is recorded, so the arm is not moved or released.")
         return None
 
+    def _take_over(self, name: str) -> None:
+        """Attach an arm found holding (``serve --attach``) only with a recorded rest pose, a table calibration and
+        a checked way from where it holds to rest; else the backend leaves it as it is and reports why."""
+        state = self.backend.read()[name]
+        env, model = self.envelopes[name], self.models[name]
+        why = None
+        if state.rest_q is None:
+            why = "no rest pose is recorded for it"
+        elif env.table is None:
+            why = "no table calibration matches its setup"
+        elif not np.all(np.isfinite(state.q)):
+            why = "its joints report no position"
+        else:
+            try:
+                self._rest_legs(env, model, state.q, state.rest_q)
+            except MoveRejected as e:
+                why = f"no checked way from where it holds to rest ({e})"
+        if why is None:
+            self.backend.attach(name)
+        else:
+            self.backend.refuse_attach(name, why)
+
     def _rest_legs(self, env: Envelope, model: ArmModel, q0: np.ndarray, goal: np.ndarray) -> list[np.ndarray]:
         """Checked joint paths from ``q0`` to the rest pose: one straight there, or two by way of home (the
         second planned from home; it is planned again from where the first ends)."""
@@ -1322,7 +1479,7 @@ class Harness:
         for name, model in self.models.items():
             env, base, g = self.envelopes[name], model.info, model.gripper
             table = "not measured (the arm cannot move until the operator runs `llm-harness calibrate`)" \
-                if env.table_z is None else f"z = {env.table_z:.3f} m"
+                if env.table is None else env.table.text()
             lines.append(f"Arm {name} ({base.type}): base at [{', '.join(f'{v:.2f}' for v in base.base_xyz)}] m facing "
                          f"yaw {math.degrees(base.base_yaw):.0f} deg (its x forward, y left); table {table}.")
             lines.append("  joints (deg): " + ", ".join(f"{j} [{math.degrees(lo):.0f}, {math.degrees(hi):.0f}]"
@@ -1338,7 +1495,8 @@ class Harness:
                   f"{cfg.floor_margin_m * 1000:.0f} mm above the table even with every joint "
                   f"{cfg.floor_tolerance_deg:g} deg off and {cfg.sag_allowance_m * 1000:.0f} mm of sag (0 mm: they "
                   "may touch it); an arm already below that may only keep gaining height; a measured point more than "
-                  f"{cfg.contact_allowance_m * 1000:.0f} mm under that stops the motion;",
+                  f"{cfg.contact_allowance_m * 1000:.0f} mm under that stops the motion; a move with until contact "
+                  f"may aim up to {cfg.contact_depth_m * 1000:.0f} mm under the floor, to end on contact;",
                   f"- one action turns no joint more than {cfg.max_excursion_deg:g} deg (home and rest are exempt): "
                   "split long motions;",
                   f"- no motion while a motor is above {cfg.max_temp_c:g} C; a joint more than "
@@ -1405,6 +1563,27 @@ def _pose_action(pose, arm: Optional[str], line: bool) -> MoveTool:
     else:
         raw = {"xyz": pose.tolist() if isinstance(pose, np.ndarray) else pose}
     return parse_action({"action": "move_tool", **raw, "arm": arm, "line": bool(line)})
+
+
+def _path_distance(path: np.ndarray, point: np.ndarray) -> float:
+    """How far ``point`` lies from the polyline ``path`` (N, 3)."""
+    path, point = np.asarray(path, dtype=float), np.asarray(point, dtype=float)
+    if len(path) == 1:
+        return float(np.linalg.norm(point - path[0]))
+    a, b = path[:-1], path[1:]
+    ab = b - a
+    t = np.clip(np.einsum("ij,ij->i", point - a, ab) / np.maximum(np.einsum("ij,ij->i", ab, ab), 1e-18), 0.0, 1.0)
+    return float(np.min(np.linalg.norm(point - (a + t[:, None] * ab), axis=1)))
+
+
+def _shortfall(goal: np.ndarray, start: np.ndarray, end: np.ndarray) -> Optional[float]:
+    """How far ``end`` stopped short of ``goal`` along the approach from ``start`` (m; negative past it), or None for
+    a move of the tool point shorter than COMMAND_MOVED_M."""
+    approach = np.asarray(goal, dtype=float) - np.asarray(start, dtype=float)
+    length = float(np.linalg.norm(approach))
+    if length < COMMAND_MOVED_M:
+        return None
+    return float(np.dot(np.asarray(goal, dtype=float) - np.asarray(end, dtype=float), approach / length))
 
 
 def _verdict(ok: bool, why: Optional[str]) -> dict:

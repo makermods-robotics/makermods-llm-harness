@@ -572,9 +572,14 @@ def test_a_descent_under_the_floor_says_how_far_down_is_allowed(sim_harness):
     import re
     h = sim_harness()
     r = over_the_surface(h)
-    result = r.nudge([0, 0, -0.11], until="contact")
+    result = r.nudge([0, 0, -0.11])
     room = re.search(r"may come down at most (\d+) mm", result.message)
-    assert result.status == "rejected" and room
+    assert result.status == "rejected" and "hard floor" in result.message and room
+    deep = r.nudge([0, 0, -0.13], until="contact", dry_run=True)        # a contact move: room for its depth too
+    contact_room = re.search(r"may come down at most (\d+) mm", deep.message)
+    assert deep.status == "rejected" and "floor of a move with until contact" in deep.message
+    assert int(contact_room.group(1)) == pytest.approx(int(room.group(1)) + 25, abs=1)
+    assert r.nudge([0, 0, -(int(contact_room.group(1)) - 2) / 1000], until="contact", dry_run=True).ok
     assert r.nudge([0, 0, -(int(room.group(1)) - 2) / 1000]).ok
 
 

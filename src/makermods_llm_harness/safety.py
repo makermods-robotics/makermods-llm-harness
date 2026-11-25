@@ -6,7 +6,8 @@ with recovery when the arm already sits under it, and the final approach to the 
 the rest pose is the lowest point of the path) and the per-tick speed, which drops to the slow speed
 whenever the path comes near the table, and keep-out boxes no point along the arm may enter (with the same
 kind of recovery for an arm that starts inside one). The table height is measured by touching it with the fingertips
-(``measure_table``) and stored per robot and arm, with the setup it was measured on.
+(``measure_table``, or the powered descent in ``probe``) and stored per robot and arm, with the setup it was measured
+on; measured at several reaches it is a ``Table`` whose height depends on the distance from the arm base.
 """
 
 from __future__ import annotations
@@ -26,7 +27,63 @@ from .robot import home
 TOUCH_TOLERANCE_M = 0.003    # two touch readings must agree this well
 TOUCH_ATTEMPTS = 3
 RECOVERY_EPS_M = 5e-4        # path-following noise of a planned lift: a passing dip this small is not a descent
+OUTSIDE_MARGIN_M = 0.005     # a table per reach, outside its measured reaches: at least this above its highest point
 REST_TOLERANCE_DEG = 5.0     # per joint: how close to the recorded rest pose an arm must be to turn on or off
+
+
+@dataclass(frozen=True)
+class Table:
+    """The table height under one arm (world z, m): ``z`` everywhere, or with ``reach`` a height that depends on the
+    horizontal distance from the arm base, linear between ``(reach_m, z_m)`` points and taken conservatively high
+    outside them (``at``; an arm whose kinematic model drifts with extension sees a flat table at different heights). ``z`` is the height
+    reported in words; with ``reach`` it is their mean."""
+    z: float
+    reach: tuple = ()
+
+    def __post_init__(self):
+        rows = tuple(sorted((float(r), float(h)) for r, h in self.reach))
+        if not all(math.isfinite(v) for row in rows for v in row) or not math.isfinite(float(self.z)):
+            raise ValueError(f"the table height must be finite numbers, got {self.z}, {self.reach}")
+        if len({r for r, _ in rows}) != len(rows):
+            raise ValueError(f"the table's reach points must differ, got {[r for r, _ in rows]}")
+        object.__setattr__(self, "z", float(self.z))
+        object.__setattr__(self, "reach", rows)
+
+    @classmethod
+    def measured(cls, points) -> "Table":
+        """From ``(reach_m, z_m)`` points: a flat table for one, a height per reach for more."""
+        rows = [(float(r), float(h)) for r, h in points]
+        if not rows:
+            raise ValueError("no table points")
+        return cls(rows[0][1]) if len(rows) == 1 else cls(float(np.mean([h for _, h in rows])), tuple(rows))
+
+    def shifted(self, dz: float) -> "Table":
+        """This table moved up by ``dz`` (down when negative) at every reach."""
+        return Table(self.z + dz, tuple((r, h + dz) for r, h in self.reach))
+
+    def at(self, points: np.ndarray, base_xy) -> np.ndarray:
+        """The table height under each of ``points`` (..., 3), world frame, for an arm based at ``base_xy``: linear
+        between the measured reaches; outside them, the higher of the highest measured height plus OUTSIDE_MARGIN_M
+        and the end segment carried on (a table seen higher with extension keeps rising beyond the last point)."""
+        points = np.asarray(points, dtype=float)
+        if not self.reach:
+            return np.full(points.shape[:-1], self.z)
+        reach = np.hypot(points[..., 0] - base_xy[0], points[..., 1] - base_xy[1])
+        r, h = (np.array(v, dtype=float) for v in zip(*self.reach))
+        inside = np.interp(reach, r, h)
+        top = float(h.max()) + OUTSIDE_MARGIN_M
+        if len(r) == 1:
+            return np.where((reach < r[0]) | (reach > r[-1]), top, inside)
+        near = h[0] + (reach - r[0]) * (h[1] - h[0]) / (r[1] - r[0])
+        far = h[-1] + (reach - r[-1]) * (h[-1] - h[-2]) / (r[-1] - r[-2])
+        return np.where(reach < r[0], np.maximum(top, near), np.where(reach > r[-1], np.maximum(top, far), inside))
+
+    def text(self) -> str:
+        if not self.reach:
+            return f"z = {self.z:.3f} m"
+        return ("z = " + ", ".join(f"{h:.4f} m at {r:.2f} m" for r, h in self.reach)
+                + " from the base (linear between; outside, the highest plus "
+                + f"{OUTSIDE_MARGIN_M * 1000:.0f} mm or the end slope carried on, whichever is higher)")
 
 
 @dataclass(frozen=True)
@@ -82,7 +139,7 @@ LIMITS: dict[str, tuple[float, float]] = {
     "floor_margin_m": (0.0, 0.2), "max_excursion_deg": (1.0, 360.0), "max_temp_c": (20.0, 100.0),
     "tracking_tolerance_deg": (0.5, 30.0), "tracking_lag_s": (0.0, 0.5), "settle_s": (0.0, 5.0),
     "contact_tolerance_m": (0.001, 0.05), "floor_tolerance_deg": (0.0, 10.0), "sag_allowance_m": (0.0, 0.05),
-    "contact_allowance_m": (0.0, 0.05), "rate_hz": (5.0, 200.0), "keep_out_margin_m": (0.0, 0.2),
+    "contact_allowance_m": (0.0, 0.05), "contact_depth_m": (0.0, 0.05), "rate_hz": (5.0, 200.0), "keep_out_margin_m": (0.0, 0.2),
     "finger_length_m": (0.0, 0.3), "jaw_half_width_m": (0.0, 0.3), "finger_margin_m": (0.0, 0.05),
 }
 
@@ -121,6 +178,10 @@ class SafetyConfig:
     # A moving arm is held once a measured monitored point is this far below the floor (a compliant fingertip
     # pressing on the table does not stop it).
     contact_allowance_m: float = 0.010
+    # A move with until "contact" may aim this far under the hard floor (the table, by default), so that a
+    # descent onto a correctly stored table can end more than contact_tolerance_m short of its target, on
+    # contact, though the jaws and the fingertip margin reach below the fingertip centre. Other moves may not.
+    contact_depth_m: float = 0.025
     rate_hz: float = 25.0              # joint targets per second while moving
     keep_out_margin_m: float = 0.03    # planned paths keep every point along the arm this far from keep-out zones
     # Gripper geometry; None takes arm_model.GRIPPERS for the arm type. Measure them on the installed tool.
@@ -129,7 +190,7 @@ class SafetyConfig:
     finger_margin_m: Optional[float] = None
     OPTIONAL: ClassVar[tuple[str, ...]] = ("finger_length_m", "jaw_half_width_m", "finger_margin_m")
     ZERO_OK: ClassVar[tuple[str, ...]] = ("floor_margin_m", "floor_tolerance_deg", "sag_allowance_m",
-                                          "contact_allowance_m", "keep_out_margin_m", "tracking_lag_s", "settle_s")
+                                          "contact_allowance_m", "contact_depth_m", "keep_out_margin_m", "tracking_lag_s", "settle_s")
 
     def __post_init__(self):
         for f in fields(self):
@@ -151,7 +212,8 @@ class SafetyConfig:
         base = GRIPPERS[arm_type]
         pick = lambda value, default: default if value is None else float(value)  # noqa: E731
         return Gripper(pick(self.finger_length_m, base.finger_length_m),
-                       pick(self.jaw_half_width_m, base.jaw_half_width_m), pick(self.finger_margin_m, base.margin_m))
+                       pick(self.jaw_half_width_m, base.jaw_half_width_m), pick(self.finger_margin_m, base.margin_m),
+                       base.opens_at_rest)
 
     @classmethod
     def from_dict(cls, raw: Optional[dict]) -> "SafetyConfig":
@@ -167,15 +229,23 @@ class SafetyConfig:
 
 
 class Envelope:
-    """The rules for one arm. ``table_z`` is the world-frame table height; without it no motion passes."""
+    """The rules for one arm. ``table_z`` is the world-frame table height, a number or a ``Table``; without it no
+    motion passes."""
 
-    def __init__(self, model: ArmModel, config: SafetyConfig, table_z: Optional[float],
+    def __init__(self, model: ArmModel, config: SafetyConfig, table_z,
                  keep_out: Sequence[KeepOut] = ()):
-        if table_z is not None and not math.isfinite(table_z):
+        if isinstance(table_z, Table):
+            self.table = table_z
+        elif table_z is None:
+            self.table = None
+        elif not math.isfinite(table_z):
             raise ValueError(f"{model.name}: the table height must be a finite number, got {table_z}")
+        else:
+            self.table = Table(float(table_z))
         self.model = model
         self.config = config
-        self.table_z = None if table_z is None else float(table_z)
+        self.table_z = None if self.table is None else self.table.z
+        self._base_xy = model.world_from_base[:2, 3].copy()
         self.max_speed = math.radians(config.max_speed_deg_s)
         self.slow_speed = math.radians(config.slow_speed_deg_s)
         self.tolerance = math.radians(config.tracking_tolerance_deg)
@@ -185,20 +255,49 @@ class Envelope:
         self._hi = np.array([z.max for z in self.zones], dtype=float).reshape(-1, 3)
 
     def clearance(self, q):
-        """Height of the lowest monitored point above the table (a float for q (6,), (T,) for a path), or
+        """Height of the lowest monitored point above the table under it (a float for q (6,), (T,) for a path), or
         None without a table height."""
-        return None if self.table_z is None else self.model.lowest_z(q) - self.table_z
+        if self.table is None:
+            return None
+        if not self.table.reach:
+            return self.model.lowest_z(q) - self.table_z
+        return self._above(self.model.points(q))
+
+    def measured_clearance(self, q) -> float:
+        """``clearance`` against the measured table heights alone: between the measured reaches the line through
+        them, outside them the nearest one (no outside margin)."""
+        self.require_table()
+        points = self.model.points(q)
+        if not self.table.reach:
+            return float(points[..., 2].min() - self.table_z)
+        reach = np.hypot(points[..., 0] - self._base_xy[0], points[..., 1] - self._base_xy[1])
+        r, h = (np.array(v, dtype=float) for v in zip(*self.table.reach))
+        return float((points[..., 2] - np.interp(reach, r, h)).min())
 
     def guarded_clearance(self, q):
         """``clearance`` with every joint up to the floor tolerance off and the sag allowance taken off."""
         self.require_table()
-        return self.model.lowest_z_within(q, self.floor_tolerance) - self.config.sag_allowance_m - self.table_z
+        if not self.table.reach:
+            return self.model.lowest_z_within(q, self.floor_tolerance) - self.config.sag_allowance_m - self.table_z
+        return self._above(self.model.points_within(q, self.floor_tolerance)) - self.config.sag_allowance_m
+
+    def table_under(self, xyz) -> float:
+        """The table height (world z) under a world point."""
+        self.require_table()
+        return float(self.table.at(np.asarray(xyz, dtype=float), self._base_xy))
+
+    def _above(self, points: np.ndarray):
+        """Lowest height of ``points`` (..., k, 3) above the table under each: a float for (k, 3)."""
+        lowest = (points[..., 2] - self.table.at(points, self._base_xy)).min(axis=-1)
+        return float(lowest) if np.ndim(lowest) == 0 else lowest
 
     def hold_floor(self, q_start) -> float:
-        """The measured clearance under which a motion from ``q_start`` is held: the hard floor, or for an arm
-        starting below it, its start less the sag allowance; either less the contact allowance."""
+        """The measured clearance under which a motion from ``q_start`` is held: the hard floor less the contact
+        allowance, anchored there; for an arm starting below that, its start less the sag allowance and
+        RECOVERY_EPS_M (it may only move back up)."""
         cfg = self.config
-        return min(cfg.floor_margin_m, float(self.clearance(q_start)) - cfg.sag_allowance_m) - cfg.contact_allowance_m
+        return min(cfg.floor_margin_m - cfg.contact_allowance_m,
+                   float(self.clearance(q_start)) - cfg.sag_allowance_m - RECOVERY_EPS_M)
 
     def zone_distances(self, q) -> tuple[np.ndarray, np.ndarray]:
         """Per zone, the signed distance of the arm's closest sampled point (negative inside) and that point's
@@ -235,7 +334,7 @@ class Envelope:
         return limit if end is None else np.minimum(limit, self.zone_distances(end)[0] - allowance)
 
     def require_table(self) -> None:
-        if self.table_z is None:
+        if self.table is None:
             raise MoveRejected(f"{self.model.name}: the table height is not known for this setup (never measured, "
                                "or measured with another bus, profile, base pose or finger length), so the arm "
                                "may not move. The operator must run `llm-harness calibrate` first.")
@@ -247,9 +346,10 @@ class Envelope:
         clearance = self.clearance(np.vstack([q_start, path]))
         return self.slow_speed if float(np.min(clearance)) < self.config.slow_zone_m else self.max_speed
 
-    def check(self, q_start, path, capped: bool = True, rest_q=None) -> None:
+    def check(self, q_start, path, capped: bool = True, rest_q=None, contact: bool = False) -> None:
         """Raise MoveRejected unless every waypoint of ``path`` (T, 6), sent in order after ``q_start``, keeps
-        every rule. ``capped=False`` lifts the excursion cap (moves to the known home and rest poses). A path
+        every rule. ``capped=False`` lifts the excursion cap (moves to the known home and rest poses). ``contact``:
+        a move with until contact, whose floor lies ``contact_depth_m`` under the hard floor. A path
         that ends at ``rest_q``, the recorded rest pose where the arm sits supported, may end under the floor
         (see ``_rest_approach``)."""
         self.require_table()
@@ -274,7 +374,7 @@ class Envelope:
                                    f"over the {cfg.max_excursion_deg:g} deg per-action limit (safety setting "
                                    "max_excursion_deg). Split the motion into smaller steps.")
         try:
-            self._check_floor(q_start, path)
+            self._check_floor(q_start, path, contact)
         except MoveRejected:
             if rest_q is None or not self._rest_approach(q_start, path, rest_q):
                 raise
@@ -350,11 +450,14 @@ class Envelope:
                                f"{depth:.0f} mm in. From here only motions that keep moving out of the zone are "
                                "allowed: move away from it first.")
 
-    def _check_floor(self, q_start, path) -> None:
-        """Every waypoint's guarded clearance stays above the floor. From under it (recovery), the clearance may
-        never drop below the highest it has reached (by more than RECOVERY_EPS_M on the way, at all at the end), and
-        once a waypoint is above the floor the rest stay there."""
-        name, floor = self.model.name, self.config.floor_margin_m
+    def _check_floor(self, q_start, path, contact: bool = False) -> None:
+        """Every waypoint's guarded clearance stays above the floor (``contact``: the hard floor less
+        ``contact_depth_m``). An arm already more than the contact allowance under the hard floor may not go lower
+        at all. From under the floor (recovery), the clearance may never drop below the highest it has reached (by
+        more than RECOVERY_EPS_M on the way, at all at the end), and once a waypoint is above the floor the rest
+        stay there."""
+        name, floor = self.model.name, self.config.floor_margin_m - (self.config.contact_depth_m if contact else 0.0)
+        kind = "floor of a move with until contact" if contact else "hard floor"
         guarded = self.guarded_clearance(np.vstack([q_start, path]))
         nominal = self.clearance(np.vstack([q_start, path]))
         if not np.all(np.isfinite(guarded)):
@@ -365,13 +468,21 @@ class Envelope:
             raise MoveRejected(text.format(what=what, mm=nominal[t] * 1000, guarded=guarded[t] * 1000,
                                            floor=floor * 1000, start=nominal[0] * 1000))
 
+        held_under = self.config.floor_margin_m - self.config.contact_allowance_m
+        if nominal[0] < held_under and float(np.min(nominal[1:])) < nominal[0]:
+            refuse(int(np.argmin(nominal[1:])) + 1,
+                   f"{name}: the arm is {{start:.0f}} mm above the table, more than the "
+                   f"{self.config.contact_allowance_m * 1000:.0f} mm contact allowance under the hard floor, and that "
+                   "motion would take the {what} lower, to "
+                   "{mm:.0f} mm. From here only motions that do not go lower are allowed: lift first (for example "
+                   "nudge dxyz [0, 0, 0.02]).")
         if guarded[0] >= floor:
             t = int(np.argmin(guarded[1:])) + 1
             if guarded[t] < floor:
                 room = (guarded[0] - floor) * 1000
                 refuse(t, f"{name}: that motion would bring the {{what}} to {{mm:.0f}} mm above the table "
-                          "({guarded:.0f} mm allowing for tracking error and sag), under the {floor:.0f} mm hard "
-                          f"floor. From here the lowest point may come down at most {room:.0f} mm (its clearance); "
+                          f"({{guarded:.0f}} mm allowing for tracking error and sag), under the {{floor:.0f}} mm "
+                          f"{kind}. From here the lowest point may come down at most {room:.0f} mm (its clearance); "
                           "aim at that or higher.")
             return
         best = np.maximum.accumulate(nominal)
@@ -382,7 +493,7 @@ class Envelope:
         later = np.flatnonzero(guarded[above[0]:] < floor) + above[0] if len(above) else np.array([], int)
         if len(dips) or len(later):
             t = int(np.argmin(nominal[1:])) + 1 if len(dips) else int(later[0])
-            refuse(t, f"{name}: the arm is {{start:.0f}} mm above the table, under the {{floor:.0f}} mm hard floor "
+            refuse(t, f"{name}: the arm is {{start:.0f}} mm above the table, under the {{floor:.0f}} mm {kind} "
                       "once tracking error and sag are allowed for, and that motion would take the {what} down to "
                       "{mm:.0f} mm. From here only motions that keep gaining height are allowed: lift first (for "
                       "example nudge dxyz [0, 0, 0.02]).")
@@ -448,8 +559,9 @@ def calibration_path(robot_name: str) -> Path:
 
 
 def load_calibration(robot_name: str) -> dict[str, dict]:
-    """``{arm: {"table_z": m, "measured_at": unix time, "setup": {...}}}`` for the robot; empty when never
-    calibrated. ``setup`` is what the height was measured with (``Robot.setup``)."""
+    """``{arm: {"table_z": m, "measured_at": unix time, "setup": {...}}}`` for the robot, plus ``"table_reach":
+    [[reach_m, z_m], ...]`` for a table measured at several reaches; empty when never calibrated. ``setup`` is what
+    the height was measured with (``Robot.setup``)."""
     path = calibration_path(robot_name)
     if not path.is_file():
         return {}
@@ -457,6 +569,10 @@ def load_calibration(robot_name: str) -> dict[str, dict]:
         raw = json.loads(path.read_text())
         data = {str(arm): {"table_z": float(v["table_z"]), "measured_at": float(v["measured_at"]),
                            "setup": dict(v["setup"])} for arm, v in raw.items()}
+        for arm, v in raw.items():
+            if v.get("table_reach"):
+                data[str(arm)]["table_reach"] = [[float(r), float(z)] for r, z in v["table_reach"]]
+                table(data[str(arm)])
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise CalibrationError(f"{path} is damaged ({e}); run `llm-harness calibrate` again") from e
     if not all(math.isfinite(v["table_z"]) for v in data.values()):
@@ -465,17 +581,29 @@ def load_calibration(robot_name: str) -> dict[str, dict]:
     return data
 
 
-def save_calibration(robot_name: str, arm: str, table_z: float, setup: dict,
+def save_calibration(robot_name: str, arm: str, table_z, setup: dict,
                      measured_at: Optional[float] = None) -> Path:
-    """Store one arm's table height and the setup it was measured with, keeping the other arms'."""
+    """Store one arm's table height (a number or a ``Table``) and the setup it was measured with, keeping the other
+    arms'."""
+    table_obj = table_z if isinstance(table_z, Table) else None
+    table_z = table_obj.z if table_obj else table_z
     if not math.isfinite(table_z):
         raise CalibrationError(f"table_z must be finite, got {table_z}")
     data = load_calibration(robot_name)
     data[arm] = {"table_z": float(table_z), "measured_at": time.time() if measured_at is None else measured_at,
                  "setup": json.loads(json.dumps(setup))}
+    if table_obj is not None and table_obj.reach:
+        data[arm]["table_reach"] = [[r, z] for r, z in table_obj.reach]
     path = calibration_path(robot_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
     return path
+
+
+def table(entry: dict) -> Table:
+    """The ``Table`` of one arm's stored calibration entry."""
+    if entry.get("table_reach"):
+        return Table(float(entry["table_z"]), tuple(tuple(row) for row in entry["table_reach"]))
+    return Table(float(entry["table_z"]))

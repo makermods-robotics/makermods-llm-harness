@@ -36,8 +36,8 @@ from .harness import Harness
 from .log import (EpisodeLog, latest_run, new_run_dir, profile, profile_text, read_episode, recorded_robot, runs_dir,
                   summary)
 from .robot import RobotError, SIM_BACKENDS
-from .safety import (REST_TOLERANCE_DEG, CalibrationError, Envelope, load_calibration, measure_table, save_calibration,
-                     watch_for_touch)
+from .safety import (REST_TOLERANCE_DEG, CalibrationError, Envelope, SafetyConfig, Table, load_calibration,
+                     measure_table, save_calibration, table as stored_table, watch_for_touch)
 from .session import AddressLock, Client, PrivateSession, Server, SessionError, default_address, ensure_free
 
 ACTION_OPS = ("observe", "move_tool", "nudge", "gripper", "move_joints", "home", "rest", "wait")
@@ -554,7 +554,7 @@ def cmd_robot_check(args) -> int:
                 calibration = f"table z = {table:.4f} m from the simulator"
             else:
                 measured = time.strftime("%Y-%m-%d %H:%M", time.localtime(stored[name]["measured_at"]))
-                calibration = f"table z = {table:.4f} m, measured {measured}"
+                calibration = f"table {harness.envelopes[name].table.text()}, measured {measured}"
             state = harness.backend.read()[name]
             torque = {True: "on", False: "off"}.get(state.enabled, "not known")
             if state.rest_q is None:
@@ -714,8 +714,58 @@ def cmd_calibrate(args) -> int:
             path = save_calibration(robot.name, arm, args.table_z, robot.setup(arm))
             print(f"{arm}: stored table z = {args.table_z:.4f} m (world frame) in {path}")
         return 0
+    if args.powered:
+        calibrate_powered(robot, arms, points=args.points, expect=args.expect, yes=args.yes)
+        return 0
+    if args.points or args.expect is not None:
+        raise CommandError("--points and --expect go with --powered")
     calibrate(robot, arms, watch=args.watch, table=not args.rest, yes=args.yes, motors_off=args.motors_off)
     return 0
+
+
+def calibrate_powered(robot: robots.Robot, arms: Sequence[str], points: Optional[Sequence[tuple]] = None,
+                      expect: Optional[float] = None, yes: bool = False, ask: Callable[[str], str] = input,
+                      say: Callable[[str], None] = print) -> dict[str, Table]:
+    """For each arm: the powered table calibration (``probe.probe_table``) at ``points`` (world x, y; default
+    straight ahead at three reaches), stored as a table per reach. ``expect``: roughly where the table is (world z);
+    without it, the table stored for the arm, which must have been measured with its present setup
+    (``Robot.setup``), at each point's own reach. The fingertips are never sent lower than ``probe.BELOW_M`` under
+    the expected height at the point. The arm must be at its recorded rest pose and ends there."""
+    from . import probe
+    stored = load_calibration(robot.name)
+    tables = {}
+    for arm in arms:
+        if expect is not None:
+            expected = Table(float(expect))
+        elif arm in stored and stored[arm]["setup"] == robot.setup(arm):
+            expected = stored_table(stored[arm])
+        else:
+            raise CalibrationError(f"{arm}: no table is stored for this arm's present setup (base pose, finger "
+                                   "length, bus); give --expect Z, roughly where the table is")
+        limit = expected.shifted(-probe.BELOW_M)
+        count = len(points or probe.DEFAULT_REACHES_M)
+        if not yes and ask(f"Arm {arm} will move on its own: down to the table at {count} points, slowly, the "
+                           f"fingertips never more than {probe.BELOW_M * 100:.0f} cm under the expected table "
+                           f"({expected.text()}). Keep the workspace clear and a hand on the emergency stop. Go on? "
+                           "[y/N] ").strip().lower() not in ("y", "yes"):
+            raise CalibrationError(f"{arm}: not calibrated")
+        safety = dataclasses.replace(SafetyConfig.from_dict(robot.safety), contact_tolerance_m=probe.SHORT_M)
+        with Harness.open(robot, table_z={arm: limit}, safety=safety) as harness:
+            where = [tuple(p) for p in points] if points else probe.default_points(harness, arm)
+            found = probe.probe_table(harness, arm, where, expected, say=say)
+            measured = Table.measured([(reach, z) for reach, z, _ in found])
+            path = save_calibration(robot.name, arm, measured, robot.setup(arm, harness.config))
+        say(f"{arm}: stored table {measured.text()} in {path}")
+        tables[arm] = measured
+    return tables
+
+
+def _point(text: str) -> tuple[float, float]:
+    try:
+        x, y = (float(v) for v in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"a probe point is X,Y in metres, got {text!r}") from None
+    return x, y
 
 
 # ── mcp / run ──
@@ -894,8 +944,18 @@ def build_parser() -> _Parser:
     how.add_argument("--table-z", type=float, metavar="Z",
                      help="store a known table height (world frame, metres) without opening the robot")
     how.add_argument("--rest", action="store_true", help="record only the folded rest pose, not the table")
+    how.add_argument("--powered", action="store_true",
+                     help="the arm finds the table itself: a slow guarded descent at a few reaches, from and back "
+                          "to its rest pose; stored as a table height per reach")
+    q.add_argument("--points", nargs="+", type=_point, metavar="X,Y",
+                   help="with --powered: probe points, world metres (default: straight ahead at 0.25, 0.32, 0.39 m)")
+    q.add_argument("--expect", type=float, metavar="Z",
+                   help="with --powered: roughly where the table is, world z (default: the table stored with the "
+                        "arm's present setup, at each point's reach; needed without one); the fingertips never go "
+                        "more than 4 cm below it")
     q.add_argument("--yes", action="store_true",
-                   help="record the rest pose without asking whether the arm is folded and supported")
+                   help="record the rest pose without asking whether the arm is folded and supported (with "
+                        "--powered: start without asking)")
     q.add_argument("--motors-off", action="store_true",
                    help="state that the motors are off, for an arm whose motors do not report their torque")
     q.set_defaults(func=cmd_calibrate)
@@ -904,7 +964,8 @@ def build_parser() -> _Parser:
     q.add_argument("--robot", help="robot name (default: the only robot)")
     q.add_argument("--read-only", action="store_true", help="refuse every action except observe and wait")
     q.add_argument("--attach", action="store_true",
-                   help="take over arms left holding with torque on by an earlier session; rest them first")
+                   help="take over arms left holding with torque on by an earlier session, when a checked path "
+                        "leads from where they hold to rest; rest them first")
     q.add_argument("--resume", nargs="?", const="", metavar="RUN_DIR",
                    help="continue an earlier episode (default: this robot's latest run)")
     q.set_defaults(func=cmd_serve)
