@@ -241,15 +241,22 @@ class ArmModel:
         return self.points(q)[..., 2].min(axis=-1)
 
     def lowest_z_within(self, q, tolerance: float):
-        """Lowest monitored height when every joint may be up to ``tolerance`` rad off ``q``: each point lowered
-        by the sum over joints of its drop when that joint alone moves by +-tolerance (a first-order worst case).
-        A float for one q, (T,) for a path."""
+        """Lowest monitored height when every joint may be up to ``tolerance`` rad off ``q`` (see
+        ``points_within``). A float for one q, (T,) for a path."""
+        lowest = self.points_within(q, tolerance)[..., 2].min(axis=-1)
+        return float(lowest) if np.ndim(q) == 1 else lowest
+
+    def points_within(self, q, tolerance: float) -> np.ndarray:
+        """The monitored points with each one lowered by the sum over joints of its drop when that joint alone
+        moves by +-tolerance rad (a first-order worst case): (k, 3) for one q, (T, k, 3) for a path."""
         qs = np.atleast_2d(np.asarray(q, dtype=float))
         steps = tolerance * np.vstack([np.eye(6), -np.eye(6)])
-        z = self.points(np.vstack([qs] + [qs + d for d in steps]))[..., 2].reshape(13, len(qs), -1)
+        pts = self.points(np.vstack([qs] + [qs + d for d in steps])).reshape(13, len(qs), -1, 3)
+        z = pts[..., 2]
         drop = np.maximum(0.0, z[0] - np.minimum(z[1:7], z[7:])).sum(axis=0)
-        lowest = (z[0] - drop).min(axis=-1)
-        return float(lowest[0]) if np.ndim(q) == 1 else lowest
+        lowered = pts[0].copy()
+        lowered[..., 2] -= drop
+        return lowered[0] if np.ndim(q) == 1 else lowered
 
     # ── plans ──
     def plan_joint_path(self, q0, q1, speed_rad_s: float, rate_hz: float) -> np.ndarray:

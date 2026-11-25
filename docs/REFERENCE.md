@@ -117,7 +117,7 @@ tick by tick while it runs. The numbers are the `SafetyConfig` defaults; a robot
 
 | Rule | Default |
 |---|---|
-| Table height: measured per arm by touching it (`llm-harness calibrate`), and used only with the bus, profile, base pose and finger length it was measured with; without it every action except `observe` and `wait` is refused | |
+| Table height: measured per arm by touching it (`llm-harness calibrate`), and used only with the bus, profile, base pose and finger length it was measured with; measured at several reaches (`calibrate --powered`), the height under each monitored point follows its distance from the arm base, linear between the measured reaches and flat beyond them; without it every action except `observe` and `wait` is refused | |
 | Rest pose: recorded per arm with its motors off (`llm-harness calibrate`); the motors turn on only within this of it on every joint, and an arm is released only there | 5 deg (`REST_TOLERANCE_DEG`) |
 | Hard floor: the elbow and wrist joints, the tool point, the fingertips and the tips of the fully open jaws stay this far above the table at every waypoint, with every joint off its plan by the floor tolerance (a worst case through the kinematics) and the whole arm lower by the sag allowance. By default they may come down to the table surface: the arm may touch the table | 0 mm, 0 deg, 0 mm (`floor_margin_m`, `floor_tolerance_deg`, `sag_allowance_m`) |
 | Recovery: an arm already under the floor may only gain height, and once above it the floor holds again | |

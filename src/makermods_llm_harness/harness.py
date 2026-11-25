@@ -25,6 +25,7 @@ from .backends.base import OFF, ArmState, ArmTarget, Backend
 from .log import EpisodeLog
 from .robot import Robot, load as load_robot
 from .safety import REST_TOLERANCE_DEG, Envelope, KeepOut, MoveRejected, SafetyConfig, load_calibration
+from .safety import table as stored_table
 
 SETTLED = math.radians(1.0)
 NEAR_VERTICAL_COS = 0.2            # |cos(pitch)| under which the tool counts as pointing straight up or down
@@ -152,7 +153,8 @@ class Harness:
              read_only: bool = False, backend_options: Optional[dict] = None,
              keep_out: Optional[Sequence[KeepOut]] = None) -> "Harness":
         """A harness for a robot (name, file, Robot, or the only robot defined) on its own backend, or on
-        ``backend``. Table heights come from ``table_z`` (one for all arms or per arm), else the backend
+        ``backend``. Table heights (numbers or ``safety.Table``) come from ``table_z`` (one for all arms or per arm),
+        else the backend
         (simulators), else the robot's stored calibration when it was measured on the same setup.
         ``backend_options`` go to the robot's backend when it is opened here. Keep-out zones come from
         ``keep_out``, else the robot's."""
@@ -168,7 +170,7 @@ class Harness:
                 heights = {n: backend.table_z for n in names}
             else:
                 stored = load_calibration(robot.name) if robot else {}
-                heights = {n: stored[n]["table_z"] for n in names
+                heights = {n: stored_table(stored[n]) for n in names
                            if n in stored and stored[n]["setup"] == robot.setup(n, safety)}
             if isinstance(table_z, dict):
                 heights.update(table_z)
@@ -1352,7 +1354,7 @@ class Harness:
         for name, model in self.models.items():
             env, base, g = self.envelopes[name], model.info, model.gripper
             table = "not measured (the arm cannot move until the operator runs `llm-harness calibrate`)" \
-                if env.table_z is None else f"z = {env.table_z:.3f} m"
+                if env.table is None else env.table.text()
             lines.append(f"Arm {name} ({base.type}): base at [{', '.join(f'{v:.2f}' for v in base.base_xyz)}] m facing "
                          f"yaw {math.degrees(base.base_yaw):.0f} deg (its x forward, y left); table {table}.")
             lines.append("  joints (deg): " + ", ".join(f"{j} [{math.degrees(lo):.0f}, {math.degrees(hi):.0f}]"

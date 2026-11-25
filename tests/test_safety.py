@@ -292,3 +292,51 @@ def test_the_default_envelope_lets_the_fingertips_touch_the_table_but_not_go_und
     with pytest.raises(MoveRejected, match="under the 0 mm hard floor"):
         env.check(HOME, tool_path(HOME, -0.032, 5))
     assert env.hold_floor(HOME) == pytest.approx(-0.010)
+
+
+# ── a table measured at several reaches ──
+def test_a_table_per_reach_moves_the_floor_with_the_reach():
+    from makermods_llm_harness.safety import Table
+    flat = envelope(0.08)
+    z = flat.table_z
+    tip = MODEL.fingertip(HOME)
+    reach = float(np.hypot(tip[0], tip[1]))
+    rising = Envelope(MODEL, CFG, Table(z, ((reach - 0.1, z), (reach, z + 0.05))))
+    assert rising.table_under(tip) == pytest.approx(z + 0.05)
+    assert rising.clearance(HOME) == pytest.approx(flat.clearance(HOME) - 0.05, abs=1e-9)
+    assert rising.guarded_clearance(HOME) == pytest.approx(flat.guarded_clearance(HOME) - 0.05, abs=1e-6)
+    down = tool_path(HOME, -0.04, 5)                               # leaves 4 cm above the flat table
+    flat.check(HOME, down, capped=False)
+    with pytest.raises(MoveRejected, match="hard floor"):
+        rising.check(HOME, down, capped=False)
+
+
+def test_one_table_height_behaves_as_a_number():
+    from makermods_llm_harness.safety import Table
+    plain, wrapped = envelope(0.30), Envelope(MODEL, CFG, Table(HOME_LOW - 0.30))
+    path = tool_path(HOME, -0.2, 5)
+    assert np.array_equal(plain.clearance(path), wrapped.clearance(path))
+    assert np.array_equal(plain.guarded_clearance(path), wrapped.guarded_clearance(path))
+    assert plain.table_z == wrapped.table_z == HOME_LOW - 0.30
+
+
+def test_a_table_per_reach_is_stored_and_used(sim_harness):
+    from makermods_llm_harness import Harness
+    from makermods_llm_harness import robot as robots
+    from makermods_llm_harness.safety import Table, load_calibration, save_calibration
+    robot = robots.simulated("sim", "maker")
+    robot.name, robot.backend, robot.arms = "bench", "real", {"arm": {"backend": "gs_usb", "port": "gs_usb:x"}}
+    measured = Table.measured([(0.26, 0.0487), (0.33, 0.0530), (0.40, 0.0602)])
+    save_calibration("bench", "arm", measured, robot.setup("arm"))
+    stored = load_calibration("bench")["arm"]
+    assert stored["table_reach"] == [[0.26, 0.0487], [0.33, 0.053], [0.4, 0.0602]]
+    assert stored["table_z"] == pytest.approx((0.0487 + 0.0530 + 0.0602) / 3)
+    from makermods_llm_harness.backends.sim import SimBackend
+    backend = type("NoTable", (SimBackend,), {"table_z": None})(robot.arm_infos())   # as a real backend
+    h = Harness.open(robot, backend=backend)
+    try:
+        assert h.envelopes["arm"].table.reach == ((0.26, 0.0487), (0.33, 0.053), (0.4, 0.0602))
+        assert h.envelopes["arm"].table_under([0.40, 0.0, 0.0]) == pytest.approx(0.0602)
+        assert "0.0487 m at 0.26 m" in h.describe()
+    finally:
+        h.close()

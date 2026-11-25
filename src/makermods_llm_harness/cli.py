@@ -554,7 +554,7 @@ def cmd_robot_check(args) -> int:
                 calibration = f"table z = {table:.4f} m from the simulator"
             else:
                 measured = time.strftime("%Y-%m-%d %H:%M", time.localtime(stored[name]["measured_at"]))
-                calibration = f"table z = {table:.4f} m, measured {measured}"
+                calibration = f"table {harness.envelopes[name].table.text()}, measured {measured}"
             state = harness.backend.read()[name]
             torque = {True: "on", False: "off"}.get(state.enabled, "not known")
             if state.rest_q is None:

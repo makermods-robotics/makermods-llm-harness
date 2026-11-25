@@ -30,6 +30,48 @@ REST_TOLERANCE_DEG = 5.0     # per joint: how close to the recorded rest pose an
 
 
 @dataclass(frozen=True)
+class Table:
+    """The table height under one arm (world z, m): ``z`` everywhere, or with ``reach`` a height that depends on the
+    horizontal distance from the arm base, linear between ``(reach_m, z_m)`` points and held flat beyond them (an
+    arm whose kinematic model drifts with extension sees a flat table at different heights). ``z`` is the height
+    reported in words; with ``reach`` it is their mean."""
+    z: float
+    reach: tuple = ()
+
+    def __post_init__(self):
+        rows = tuple(sorted((float(r), float(h)) for r, h in self.reach))
+        if not all(math.isfinite(v) for row in rows for v in row) or not math.isfinite(float(self.z)):
+            raise ValueError(f"the table height must be finite numbers, got {self.z}, {self.reach}")
+        if len({r for r, _ in rows}) != len(rows):
+            raise ValueError(f"the table's reach points must differ, got {[r for r, _ in rows]}")
+        object.__setattr__(self, "z", float(self.z))
+        object.__setattr__(self, "reach", rows)
+
+    @classmethod
+    def measured(cls, points) -> "Table":
+        """From ``(reach_m, z_m)`` points: a flat table for one, a height per reach for more."""
+        rows = [(float(r), float(h)) for r, h in points]
+        if not rows:
+            raise ValueError("no table points")
+        return cls(rows[0][1]) if len(rows) == 1 else cls(float(np.mean([h for _, h in rows])), tuple(rows))
+
+    def at(self, points: np.ndarray, base_xy) -> np.ndarray:
+        """The table height under each of ``points`` (..., 3), world frame, for an arm based at ``base_xy``."""
+        points = np.asarray(points, dtype=float)
+        if not self.reach:
+            return np.full(points.shape[:-1], self.z)
+        reach = np.hypot(points[..., 0] - base_xy[0], points[..., 1] - base_xy[1])
+        r, h = zip(*self.reach)
+        return np.interp(reach, r, h)
+
+    def text(self) -> str:
+        if not self.reach:
+            return f"z = {self.z:.3f} m"
+        return ("z = " + ", ".join(f"{h:.4f} m at {r:.2f} m" for r, h in self.reach)
+                + " from the base (linear between, flat beyond)")
+
+
+@dataclass(frozen=True)
 class KeepOut:
     """A named axis-aligned box in the world frame (metres) that no part of an arm may enter."""
     name: str
@@ -167,15 +209,23 @@ class SafetyConfig:
 
 
 class Envelope:
-    """The rules for one arm. ``table_z`` is the world-frame table height; without it no motion passes."""
+    """The rules for one arm. ``table_z`` is the world-frame table height, a number or a ``Table``; without it no
+    motion passes."""
 
-    def __init__(self, model: ArmModel, config: SafetyConfig, table_z: Optional[float],
+    def __init__(self, model: ArmModel, config: SafetyConfig, table_z,
                  keep_out: Sequence[KeepOut] = ()):
-        if table_z is not None and not math.isfinite(table_z):
+        if isinstance(table_z, Table):
+            self.table = table_z
+        elif table_z is None:
+            self.table = None
+        elif not math.isfinite(table_z):
             raise ValueError(f"{model.name}: the table height must be a finite number, got {table_z}")
+        else:
+            self.table = Table(float(table_z))
         self.model = model
         self.config = config
-        self.table_z = None if table_z is None else float(table_z)
+        self.table_z = None if self.table is None else self.table.z
+        self._base_xy = model.world_from_base[:2, 3].copy()
         self.max_speed = math.radians(config.max_speed_deg_s)
         self.slow_speed = math.radians(config.slow_speed_deg_s)
         self.tolerance = math.radians(config.tracking_tolerance_deg)
@@ -185,14 +235,30 @@ class Envelope:
         self._hi = np.array([z.max for z in self.zones], dtype=float).reshape(-1, 3)
 
     def clearance(self, q):
-        """Height of the lowest monitored point above the table (a float for q (6,), (T,) for a path), or
+        """Height of the lowest monitored point above the table under it (a float for q (6,), (T,) for a path), or
         None without a table height."""
-        return None if self.table_z is None else self.model.lowest_z(q) - self.table_z
+        if self.table is None:
+            return None
+        if not self.table.reach:
+            return self.model.lowest_z(q) - self.table_z
+        return self._above(self.model.points(q))
 
     def guarded_clearance(self, q):
         """``clearance`` with every joint up to the floor tolerance off and the sag allowance taken off."""
         self.require_table()
-        return self.model.lowest_z_within(q, self.floor_tolerance) - self.config.sag_allowance_m - self.table_z
+        if not self.table.reach:
+            return self.model.lowest_z_within(q, self.floor_tolerance) - self.config.sag_allowance_m - self.table_z
+        return self._above(self.model.points_within(q, self.floor_tolerance)) - self.config.sag_allowance_m
+
+    def table_under(self, xyz) -> float:
+        """The table height (world z) under a world point."""
+        self.require_table()
+        return float(self.table.at(np.asarray(xyz, dtype=float), self._base_xy))
+
+    def _above(self, points: np.ndarray):
+        """Lowest height of ``points`` (..., k, 3) above the table under each: a float for (k, 3)."""
+        lowest = (points[..., 2] - self.table.at(points, self._base_xy)).min(axis=-1)
+        return float(lowest) if np.ndim(lowest) == 0 else lowest
 
     def hold_floor(self, q_start) -> float:
         """The measured clearance under which a motion from ``q_start`` is held: the hard floor, or for an arm
@@ -235,7 +301,7 @@ class Envelope:
         return limit if end is None else np.minimum(limit, self.zone_distances(end)[0] - allowance)
 
     def require_table(self) -> None:
-        if self.table_z is None:
+        if self.table is None:
             raise MoveRejected(f"{self.model.name}: the table height is not known for this setup (never measured, "
                                "or measured with another bus, profile, base pose or finger length), so the arm "
                                "may not move. The operator must run `llm-harness calibrate` first.")
@@ -448,8 +514,9 @@ def calibration_path(robot_name: str) -> Path:
 
 
 def load_calibration(robot_name: str) -> dict[str, dict]:
-    """``{arm: {"table_z": m, "measured_at": unix time, "setup": {...}}}`` for the robot; empty when never
-    calibrated. ``setup`` is what the height was measured with (``Robot.setup``)."""
+    """``{arm: {"table_z": m, "measured_at": unix time, "setup": {...}}}`` for the robot, plus ``"table_reach":
+    [[reach_m, z_m], ...]`` for a table measured at several reaches; empty when never calibrated. ``setup`` is what
+    the height was measured with (``Robot.setup``)."""
     path = calibration_path(robot_name)
     if not path.is_file():
         return {}
@@ -457,6 +524,10 @@ def load_calibration(robot_name: str) -> dict[str, dict]:
         raw = json.loads(path.read_text())
         data = {str(arm): {"table_z": float(v["table_z"]), "measured_at": float(v["measured_at"]),
                            "setup": dict(v["setup"])} for arm, v in raw.items()}
+        for arm, v in raw.items():
+            if v.get("table_reach"):
+                data[str(arm)]["table_reach"] = [[float(r), float(z)] for r, z in v["table_reach"]]
+                table(data[str(arm)])
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise CalibrationError(f"{path} is damaged ({e}); run `llm-harness calibrate` again") from e
     if not all(math.isfinite(v["table_z"]) for v in data.values()):
@@ -465,17 +536,29 @@ def load_calibration(robot_name: str) -> dict[str, dict]:
     return data
 
 
-def save_calibration(robot_name: str, arm: str, table_z: float, setup: dict,
+def save_calibration(robot_name: str, arm: str, table_z, setup: dict,
                      measured_at: Optional[float] = None) -> Path:
-    """Store one arm's table height and the setup it was measured with, keeping the other arms'."""
+    """Store one arm's table height (a number or a ``Table``) and the setup it was measured with, keeping the other
+    arms'."""
+    table_obj = table_z if isinstance(table_z, Table) else None
+    table_z = table_obj.z if table_obj else table_z
     if not math.isfinite(table_z):
         raise CalibrationError(f"table_z must be finite, got {table_z}")
     data = load_calibration(robot_name)
     data[arm] = {"table_z": float(table_z), "measured_at": time.time() if measured_at is None else measured_at,
                  "setup": json.loads(json.dumps(setup))}
+    if table_obj is not None and table_obj.reach:
+        data[arm]["table_reach"] = [[r, z] for r, z in table_obj.reach]
     path = calibration_path(robot_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
     return path
+
+
+def table(entry: dict) -> Table:
+    """The ``Table`` of one arm's stored calibration entry."""
+    if entry.get("table_reach"):
+        return Table(float(entry["table_z"]), tuple(tuple(row) for row in entry["table_reach"]))
+    return Table(float(entry["table_z"]))
