@@ -697,8 +697,9 @@ class Harness:
         this result) the arm is held, read, and judged. Contact (done) when the samples taken under the watch show
         the tool point still over STILL_S (moving less than COMMAND_MOVED_M, also up to the held reading), the held
         reading is more than the contact tolerance short along the approach, and the tool point is within
-        CONTACT_LATERAL_M of the planned tool path or the arm's lowest point is at the table (within the contact
-        tolerance above it: resting on the known surface explains a slide along it). Anything else is ``stopped``;
+        CONTACT_LATERAL_M of the planned tool path or the arm's lowest point is at the measured table (within the
+        contact tolerance above it, no outside-reach margin: resting on the known surface explains a slide along
+        it). Anything else is ``stopped``;
         too few samples to tell, too."""
         model, env, tol = self.models[name], self.envelopes[name], self.config.contact_tolerance_m
         blocked = isinstance(result, _BlockedShort)
@@ -723,7 +724,7 @@ class Harness:
             if short is not None:
                 error["short_m"] = round(short, 4)
             lateral = math.inf if planned is None else _path_distance(planned, xyz)
-            clearance = float(env.clearance(state.q))
+            clearance = env.measured_clearance(state.q)
             if window is None:
                 why = f"too few samples after the command ended to tell whether it stood still over {STILL_S:g} s"
             else:

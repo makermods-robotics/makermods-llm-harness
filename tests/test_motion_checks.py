@@ -610,3 +610,31 @@ def test_repeated_contact_nudges_from_under_the_measured_limit_are_refused(sim_h
         assert result.status == "rejected" and "only motions that do not go lower" in result.message
     assert h.state().arms["arm"].clearance_m >= held_at - 0.0005                     # no ratchet
     assert r.nudge([0, 0, 0.02]).ok                                                  # lifting is allowed
+
+
+def per_reach(rested, below_m, reaches):
+    """A table measured at ``reaches`` (two), each ``below_m`` under the world z ``rested``."""
+    from makermods_llm_harness.safety import Table
+    z = rested - below_m
+    return {"arm": Table(z, tuple((r, z) for r in reaches))}
+
+
+def test_a_blocked_ending_13_mm_above_the_measured_table_outside_its_reaches_is_not_contact(sim_harness,
+                                                                                            monkeypatch):
+    h, result = side_slide(sim_harness, monkeypatch)
+    rested = h.state().arms["arm"].clearance_m + h.envelopes["arm"].table_z
+    h2, result = side_slide(sim_harness, monkeypatch, table_z=per_reach(rested, 0.013, (0.15, 0.20)))
+    assert h2.state().arms["arm"].clearance_m < 0.010       # taken high outside the reaches: 8 mm ...
+    assert result.status == "stopped" and result.contact is None, result.message     # ... but 13 mm measured
+
+
+def test_a_blocked_ending_resting_on_the_measured_table_beyond_its_last_reach_is_contact(sim_harness, monkeypatch):
+    h, result = side_slide(sim_harness, monkeypatch)
+    state = h.backend.read()["arm"]
+    model = h.models["arm"]
+    rested = h.state().arms["arm"].clearance_m + h.envelopes["arm"].table_z
+    lowest = model.points(state.q)[int(np.argmin(model.points(state.q)[:, 2]))]
+    reach = float(np.hypot(lowest[0], lowest[1]))
+    table = per_reach(rested, -0.0015, (reach - 0.10, reach - 0.018))    # 1.5 mm over it, 18 mm short of its reach
+    h2, result = side_slide(sim_harness, monkeypatch, table_z=table)
+    assert result.status == "done" and result.contact is not None, result.message

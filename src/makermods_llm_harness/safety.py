@@ -263,6 +263,17 @@ class Envelope:
             return self.model.lowest_z(q) - self.table_z
         return self._above(self.model.points(q))
 
+    def measured_clearance(self, q) -> float:
+        """``clearance`` against the measured table heights alone: between the measured reaches the line through
+        them, outside them the nearest one (no outside margin)."""
+        self.require_table()
+        points = self.model.points(q)
+        if not self.table.reach:
+            return float(points[..., 2].min() - self.table_z)
+        reach = np.hypot(points[..., 0] - self._base_xy[0], points[..., 1] - self._base_xy[1])
+        r, h = (np.array(v, dtype=float) for v in zip(*self.table.reach))
+        return float((points[..., 2] - np.interp(reach, r, h)).min())
+
     def guarded_clearance(self, q):
         """``clearance`` with every joint up to the floor tolerance off and the sag allowance taken off."""
         self.require_table()
