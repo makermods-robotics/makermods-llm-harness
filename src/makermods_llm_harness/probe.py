@@ -2,15 +2,16 @@
 
 For each probe point the fingertips go above it with the gripper pointing down (as steeply as the arm can there,
 jaws closed), then the fingertip target goes down STEP_M at a time at PROBE_SPEED_DEG_S. After each step, once its
-command has ended, the measured fingertip height is read twice, STILL_S apart. Contact: over the last STILL_STEPS
-steps the command went down while the measured fingertips moved less than STILL_M, they stand still, and they stand
-more than CONTACT_M above their command beyond the offset they held while descending freely over the first
-FREE_STEPS steps. A step the harness stops as ending short of its target is a reading like any other (the arm
-holds there and the next step's target is absolute); falling more than PRESS_M behind without standing still ends
-the probe. Lag closes once a command has ended, so it never passes; a support does not. The table there is
-the measured fingertip height. The descent never commands the fingertips lower than ``limit_z``, and the harness it
-runs on has its table at ``limit_z``, so its own floor refuses anything lower. The arm starts at rest with its
-motors cool and is rested at the end, also after a failure.
+command has ended, the measured fingertip height is read twice, STILL_S apart, and set against the fingertip height
+the probe commanded. Contact: over the last STILL_STEPS steps the command went down while the measured fingertips
+moved less than STILL_M, they stand still, and they stand more than CONTACT_M above their command beyond the offset
+they held while descending freely over the first FREE_STEPS steps. A step the harness stops only because it ended
+short of its target (``ended_short``) is a reading like any other: the arm holds there and the next step's target
+is absolute. Any other stop or fault ends the probe, as does falling more than PRESS_M behind without standing
+still. Lag closes once a command has ended, so it never passes; a support does not. The table there is the
+measured fingertip height. No target ever lies more than BELOW_CONTACT_M under the lowest fingertip height measured
+at that point, nor under ``limit_z``, and the harness it runs on has its table at ``limit_z``, so its own floor
+refuses anything lower. The arm starts at rest with its motors cool and is rested at the end, also after a failure.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ STILL_STEPS = 3              # contact: over this many steps ...
 STILL_M = 0.001              # ... the measured fingertips moved less than this
 CONTACT_M = 0.004            # ... and stand this far above their command beyond the free offset
 PRESS_M = 0.012              # further behind their command than this without contact ends the probe
+BELOW_CONTACT_M = 0.016      # no target lies further than this under the lowest measured fingertip height
 FREE_FRACTION = 0.5          # free descent: the measured fingertips follow at least this fraction of the command
 STILL_S = 0.3                # the second reading after a step, to see the fingertips stand still
 PROBE_SPEED_DEG_S = 3.0
@@ -96,12 +98,16 @@ def _probe_point(harness: Harness, arm: str, x: float, y: float, expect_z: float
         if target < lowest:
             raise CalibrationError(f"{arm}: no table found at ({x:.3f}, {y:.3f}) down to fingertip z = "
                                    f"{limit_z:.3f} m; give a lower --expect if the table is lower")
+        if rows and target < min(m for _, m, _ in rows) - BELOW_CONTACT_M:
+            raise CalibrationError(f"{arm}: the fingertips at ({x:.3f}, {y:.3f}) stay near z = "
+                                   f"{min(m for _, m, _ in rows):.3f} m while their command went "
+                                   f"{BELOW_CONTACT_M * 1000:.0f} mm lower; stopped before pressing harder")
         result = harness.step(_move(model, x, y, target, pitch, yaw, arm, PROBE_SPEED_DEG_S)).result
-        short = result.status == "stopped" and (result.error or {}).get("short_m") is not None
-        if result.status in ("fault", "rejected") or (result.status == "stopped" and not short):
+        short = result.status == "stopped" and (result.error or {}).get("ended_short") is True
+        if not (result.ok or short):
             raise CalibrationError(f"{arm}: probe step at fingertip z = {target:.3f} m: {result.status}: "
                                    f"{result.message}")
-        rows.append(_fingertips(harness, arm))
+        rows.append(_fingertips(harness, arm, target))
         offsets = [m - c for c, m, _ in rows]
         if len(rows) == FREE_STEPS:
             went = rows[0][1] - rows[-1][1]
@@ -131,14 +137,15 @@ def _lowest_target(model, limit_z: float) -> float:
     return limit_z + model.gripper.margin_m + 0.002
 
 
-def _fingertips(harness: Harness, arm: str) -> tuple[float, float, bool]:
-    """(commanded, measured fingertip z, whether they stood still over STILL_S) once the step's command ended."""
+def _fingertips(harness: Harness, arm: str, target: float) -> tuple[float, float, bool]:
+    """(the commanded fingertip z ``target``, measured fingertip z, whether they stood still over STILL_S) once the
+    step's command ended."""
     model = harness.models[arm]
     first = harness.backend.read()[arm]
     time.sleep(STILL_S)
     second = harness.backend.read()[arm]
     z1, z2 = float(model.fingertip(first.q)[2]), float(model.fingertip(second.q)[2])
-    return float(model.fingertip(second.q_target)[2]), z2, abs(z2 - z1) < STILL_M / 2
+    return target, z2, abs(z2 - z1) < STILL_M / 2
 
 
 def _move(model, x, y, tip_z, pitch, yaw, arm, speed: Optional[float] = None) -> dict:

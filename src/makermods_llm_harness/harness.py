@@ -623,7 +623,7 @@ class Harness:
                  standing: Optional[np.ndarray] = None, start: Optional[np.ndarray] = None) -> Result:
         """A tool move's result with how far the measured tool pose ended from ``goal`` (``error``; with ``start``,
         the tool point the move started from, also ``short_m``: how far it ended short of the goal along the
-        approach). Done only from valid, fresh final feedback (no fault, finite joints, torque on, every joint's
+        approach; ``ended_short`` True when that alone stopped it). Done only from valid, fresh final feedback (no fault, finite joints, torque on, every joint's
         sample at most FRESH_HOLD_S old; a fault otherwise) with the measured tool pose within the arrival
         tolerance. A miss that the joint ``standing`` error the arm held before the move (command minus measurement)
         explains, up to SAG_ARRIVAL_TOL_M, is done with the miss in the message; any other miss is ``stopped``, and so
@@ -675,7 +675,7 @@ class Harness:
                                     f"({position * 1000:.0f} mm and {math.degrees(angle):.1f} deg from it). It may "
                                     "rest on something, or the arm sags there: the arm holds where it is. Aim "
                                     f"{short * 1000:.0f} mm further, or move with until contact.")
-            held.error = result.error
+            held.error = dict(result.error, ended_short=True) if held.status == "stopped" else result.error
             return held
         if result.ok and (position > ARRIVAL_TOL_M or math.degrees(angle) > ARRIVAL_TOL_DEG):
             explained = False

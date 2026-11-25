@@ -135,20 +135,35 @@ def test_powered_needs_its_own_options_and_asks_first(bench, monkeypatch, capsys
                               say=lambda s: None)
 
 
-def test_a_probe_step_stopped_short_is_a_reading_not_a_failure(bench, monkeypatch):
+def _probe_steps(monkeypatch, change):
+    """Wrap Harness.step: ``change(harness, obs)`` on every probe step; returns the commanded fingertip targets."""
     from makermods_llm_harness.harness import Harness
-    real = Harness.step
-    stopped = []
+    real, targets = Harness.step, []
 
-    def step(self, action, *args, **kwargs):          # as a real arm whose free offset is large: steps resting on
-        obs = real(self, action, *args, **kwargs)      # the table end stopped, short of their target
-        short = (obs.result.error or {}).get("short_m")
-        if isinstance(action, dict) and action.get("speed_deg_s") == probe.PROBE_SPEED_DEG_S and obs.result.ok \
-                and short is not None and short > 0.003:
-            obs.result.status, obs.result.message = "stopped", "arm: ended short of the target along the approach"
-            stopped.append(short)
+    def step(self, action, *args, **kwargs):
+        obs = real(self, action, *args, **kwargs)
+        if isinstance(action, dict) and action.get("speed_deg_s") == probe.PROBE_SPEED_DEG_S:
+            model = self.models["left"]
+            p, w = math.radians(action["pitch_deg"]), math.radians(action["yaw_deg"])
+            pointing = np.array([math.cos(p) * math.cos(w), math.cos(p) * math.sin(w), math.sin(p)])
+            targets.append(float(action["xyz"][2] + model.gripper.finger_length_m * pointing[2]))
+            change(self, obs)
         return obs
     monkeypatch.setattr(Harness, "step", step)
+    return targets
+
+
+def test_a_probe_step_stopped_short_is_a_reading_not_a_failure(bench, monkeypatch):
+    stopped = []
+
+    def change(harness, obs):                          # as a real arm whose free offset is large: steps resting on
+        short = (obs.result.error or {}).get("short_m")    # the table end stopped short and held where they stand
+        if obs.result.ok and short is not None and short > 0.003:
+            harness.confirm_hold(["left"])
+            obs.result.status, obs.result.message = "stopped", "left: ended short of the target along the approach"
+            obs.result.error = dict(obs.result.error, ended_short=True)
+            stopped.append(short)
+    _probe_steps(monkeypatch, change)
     cli.calibrate_powered(robots.load("bench"), ["left"], points=POINTS[:2], expect=0.05, yes=True, say=lambda s: None)
     assert stopped
     measured = dict(load_calibration("bench")["left"]["table_reach"])
@@ -156,3 +171,37 @@ def test_a_probe_step_stopped_short_is_a_reading_not_a_failure(bench, monkeypatc
         reach = math.hypot(x, y)
         z = min(measured.items(), key=lambda kv: abs(kv[0] - reach))[1]
         assert z == pytest.approx(table_at(reach), abs=0.003)
+
+
+def test_any_other_stop_of_a_probe_step_ends_the_probe(bench, monkeypatch):
+    def change(harness, obs):                          # a tracking stop also says how far short the move ended
+        if len(seen) == probe.FREE_STEPS + 1:
+            harness.confirm_hold(["left"])
+            obs.result.status, obs.result.message = "stopped", "left: shoulder_lift fell behind its command"
+            obs.result.error = dict(obs.result.error or {}, short_m=0.004)
+        seen.append(obs.result.status)
+    seen = []
+    _probe_steps(monkeypatch, change)
+    with pytest.raises(CalibrationError, match="fell behind its command"):
+        cli.calibrate_powered(robots.load("bench"), ["left"], points=POINTS[:1], expect=0.05, yes=True,
+                              say=lambda s: None)
+    assert len(seen) == probe.FREE_STEPS + 2 and load_calibration("bench") == {}
+
+
+def test_a_blocked_fingertip_is_never_commanded_far_under_where_it_stands(bench, monkeypatch):
+    from makermods_llm_harness import harness as harness_module
+    monkeypatch.setattr(probe, "CONTACT_M", 1.0)       # the probe's contact and pressure checks and the harness's
+    monkeypatch.setattr(probe, "PRESS_M", 1.0)         # blocked-joint check see nothing: the bound alone remains
+    monkeypatch.setattr(harness_module, "judge_motion", lambda *a, **k: None)
+    measured = []
+
+    def change(harness, obs):
+        measured.append(float(harness.models["left"].fingertip(harness.backend.read()["left"].q)[2]))
+    targets = _probe_steps(monkeypatch, change)
+    with pytest.raises(CalibrationError, match="stopped before pressing harder"):
+        cli.calibrate_powered(robots.load("bench"), ["left"], points=POINTS[:1], expect=0.05, yes=True,
+                              say=lambda s: None)
+    lowest = min(measured)
+    assert lowest == pytest.approx(table_at(math.hypot(*POINTS[0])), abs=0.003)
+    assert min(targets) >= lowest - probe.BELOW_CONTACT_M - 1e-6
+    assert min(targets) > 0.05 - probe.BELOW_M + 0.01                 # far above the limit it used to reach

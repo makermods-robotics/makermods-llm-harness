@@ -88,7 +88,7 @@ llm-harness op nudge 0 0 -0.08 --until contact
 |---|---|
 | `step`, `time` | actions so far in this run; Unix time |
 | `result.status`, `result.message`, `result.action` | how the action ended, why, and the action as parsed |
-| `result.error` | after a tool move: `position_m` and `angle_deg` between the measured and the requested tool pose, and `short_m`, how far the tool point ended short of the target along the approach (negative past it) |
+| `result.error` | after a tool move: `position_m` and `angle_deg` between the measured and the requested tool pose, and `short_m`, how far the tool point ended short of the target along the approach (negative past it); `ended_short: true` when ending more than the contact tolerance short is what stopped it |
 | `result.contact` | after a move with `until: "contact"` that stopped on contact: `xyz` of the tool point and `short_m` from the target |
 | `result.grip` | after `gripper`: `opening` (measured), `target`, `settled`, `holding`. Done, not holding, within 0.02 of the request, or settled (less than 0.005 over 0.5 s) within 0.04 of it (0.15 when opening: jaws stop at their mechanical end). Holding when, closing, the jaws stalled (less than 0.003 over 1 s) more than 0.06 short of the request after closing at least 0.05, or were already closed on something. Anything else by the 2.5 s limit (still moving or creeping, stalled without that progress, an opening that does not open): `stopped` (undetermined or blocked), the gripper held where it is |
 | `arms.<arm>.tool` | `xyz` (m) and `pitch_deg`, `yaw_deg`, `roll_deg`: the same angles `move_tool` takes |
