@@ -534,14 +534,17 @@ def test_an_old_firmware_arm_carrying_load_is_held_by_another_program_and_attach
 
 
 @pytest.mark.parametrize("missing", ["rest pose", "table", "way home"])
-def test_attach_leaves_a_held_arm_alone_without_a_rest_pose_a_table_or_a_checked_way_home(missing):
+def test_attach_leaves_a_held_arm_alone_without_a_rest_pose_a_table_or_a_checked_way_home(missing, monkeypatch):
+    from makermods_llm_harness.safety import MoveRejected
     arm, sim, model, rest = held_by_a_dead_program()
     held = np.array(sim.positions[:6])
     backend = RealBackend("maker", {}, {}, [ArmInfo("arm", "maker")], arms={"arm": arm},
                           rest_q={} if missing == "rest pose" else {"arm": rest}, attach=True)
-    table = {"rest pose": float(model.lowest_z(rest)) - 0.10, "table": None,
-             "way home": float(model.lowest_z(held)) + 0.02}[missing]       # the held pose lies under that table
-    h = Harness.open(backend=backend, table_z=table)
+    if missing == "way home":
+        def no_way(self, env, model, q0, goal):
+            raise MoveRejected("arm: a keep-out zone lies between it and the rest pose.")
+        monkeypatch.setattr(Harness, "_rest_legs", no_way)
+    h = Harness.open(backend=backend, table_z=None if missing == "table" else float(model.lowest_z(rest)) - 0.10)
     state = backend.read()["arm"]
     assert "it was not taken over" in state.fault and "maker-arm rest --arm arm" in state.fault
     assert {"rest pose": "no rest pose", "table": "no table calibration", "way home": "no checked way"}[missing] \
